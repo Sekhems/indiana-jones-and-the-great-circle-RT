@@ -34,6 +34,7 @@ $exports = @(
 $localExports = @(
     'vkCreateDevice',
     'vkEnumerateDeviceExtensionProperties',
+    'vkGetPhysicalDeviceFeatures',
     'vkGetPhysicalDeviceProperties',
     'vkGetPhysicalDeviceProperties2',
     'vkGetPhysicalDeviceProperties2KHR',

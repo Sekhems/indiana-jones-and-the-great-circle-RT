@@ -124,6 +124,10 @@ vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_
 	
 extern "C" VKAPI_ATTR void VKAPI_CALL
 vkDestroyShaderModule(VkDevice device, VkShaderModule shaderModule, const VkAllocationCallbacks* pAllocator);
+
+// Implemented further below (uniform shader profile hook).
+extern "C" VKAPI_ATTR void VKAPI_CALL
+vkGetPhysicalDeviceFeatures(VkPhysicalDevice pd, VkPhysicalDeviceFeatures* pFeatures);
 	
 	
 
@@ -199,9 +203,36 @@ namespace {
         bool virtualDeferred = false, virtualPipelineLibrary = false, virtualDynamicRendering = false;
         RtCompatTier tier = RT_TIER_SOFTWARE;
         uint32_t apiVersion = VK_API_VERSION_1_0;
+        // ---- what the DRIVER really reports, independent of the RT policy ----
+        // NOTE: when FollowHardwareCaps=1 these bits override the INI deny flags for
+        // shader classification. That is deliberate and safe: the previously released
+        // builds made the INI authoritative, so any NEW capability a card reports can
+        // only move modules from "denied/fake" to "sent to the driver", which is the
+        // direction that restores rendering (a working shader was previously faked).
+        // Set FollowHardwareCaps=0 to get the old INI-authoritative behaviour back.
+        // Capability denial for shader modules must follow the hardware, not the
+        // RT compatibility mode and not a fixed INI list: otherwise a GTX 1060
+        // (which has no RT but does have float16/int16) is treated exactly like
+        // a GCN2 card, and the modules it produces stop matching spv_replace.
+        bool realFloat16 = false;     // shaderFloat16
+        bool realInt16 = false;       // shaderInt16
+        bool realDotProduct = false;  // shaderIntegerDotProduct
+        bool realFloat64 = false;     // shaderFloat64
+        bool realInt64 = false;       // shaderInt64
+        bool realStorage16 = false;   // storageBuffer16BitAccess / storageInputOutput16
+        bool realStorage8 = false;    // storageBuffer8BitAccess
+        bool realMesh = false;        // VK_EXT_mesh_shader
+        bool capsProbed = false;
     };
 
     struct ActiveRtDevice {
+        // Shader capabilities of the physical device this VkDevice was created from.
+        // Stored per device so a second GPU in the machine is judged on its own bits.
+        bool hwProbed = false;
+        bool hwFloat16 = false;
+        bool hwInt16 = false;
+        bool hwDotProduct = false;
+        bool hwMesh = false;
         bool nativeAS = false;
         bool nativeRTP = false;
         bool nativeRQ = false;
@@ -214,6 +245,19 @@ namespace {
 
     volatile LONG g_rtSpoof = 1; // compatibility mirror: 1 = fallback policy enabled
     volatile LONG g_rtCompatMode = RT_MODE_AUTO;
+    // 1 = report "this GPU has no RT at all" on every machine. With FollowHardwareCaps
+    // this makes the game generate the SAME RT-less shader variants everywhere, so a
+    // single spv_replace folder is valid on GCN2, Pascal/Turing and Intel alike.
+    volatile LONG g_forceVirtualRt = 0;
+    // 1 = pin the game-visible shader feature booleans (Int16/Int64/Float64/8-bit
+    // storage/dot product) to the reference profile, so every GPU asks the game for
+    // the same shader permutations and one spv_replace folder fits all of them.
+    // Read from [spirv] UniformShaderProfile (VulkanProxy.ini); see LoadSpvConfig.
+    volatile LONG g_uniformShaderProfile = 0;
+
+    inline bool UniformShaderProfileEnabled() noexcept {
+        return InterlockedCompareExchange(&g_uniformShaderProfile, 0, 0) != 0;
+    }
     INIT_ONCE g_rtCompatInitOnce = INIT_ONCE_STATIC_INIT;
     SRWLOCK g_rtCapsLock = SRWLOCK_INIT;
     SRWLOCK g_activeRtLock = SRWLOCK_INIT;
@@ -234,8 +278,11 @@ namespace {
         if (_wcsicmp(mode, L"native") == 0) selected = RT_MODE_NATIVE;
         else if (_wcsicmp(mode, L"hybrid") == 0) selected = RT_MODE_HYBRID;
         else if (_wcsicmp(mode, L"software") == 0 || _wcsicmp(mode, L"software_compat") == 0) selected = RT_MODE_SOFTWARE;
+        const LONG forceVirtual = static_cast<LONG>(GetPrivateProfileIntW(L"compat", L"ForceVirtualRt", 0, iniPath));
         InterlockedExchange(&g_rtCompatMode, selected);
         InterlockedExchange(&g_rtSpoof, selected == RT_MODE_NATIVE ? 0 : 1);
+        InterlockedExchange(&g_forceVirtualRt, forceVirtual != 0 ? 1 : 0);
+        LogLine("RT capability policy: ForceVirtualRt=%ld (1 = no native RT reported on any GPU)", (long)g_forceVirtualRt);
         LogLine("RT compatibility policy: Mode=%ls (modeId=%ld, fallback=%ld, ini=%ls)",
             mode, selected, (long)g_rtSpoof, iniPath);
         return TRUE;
@@ -407,6 +454,9 @@ namespace {
         const LONG mode = GetRtCompatMode();
         const bool allowFallback = mode != RT_MODE_NATIVE;
         const bool forceSoftware = mode == RT_MODE_SOFTWARE;
+        // Uniform RT story: never let the game discover RT hardware (avoids a
+        // completely different shader permutation on RTX / Arc / RDNA3).
+        if (g_forceVirtualRt) { c.nativeAS = false; c.nativeRTP = false; c.nativeRQ = false; }
         c.virtualAS = allowFallback && (forceSoftware || !c.nativeAS);
         c.virtualRTP = allowFallback && (forceSoftware || !c.nativeRTP);
         c.virtualRQ = allowFallback && (forceSoftware || !c.nativeRQ);
@@ -419,6 +469,35 @@ namespace {
         if (forceSoftware || (!c.nativeAS && !c.nativeRTP && !c.nativeRQ)) c.tier = RT_TIER_SOFTWARE;
         else if (c.nativeAS && c.nativeRTP && c.nativeRQ && mode != RT_MODE_SOFTWARE) c.tier = RT_TIER_NATIVE;
         else c.tier = RT_TIER_HYBRID;
+
+        // Independent capability probe: ask the driver for the concrete shader
+        // features and remember them on the device profile. Shader classification
+        // later uses these bits instead of the "GCN2 has nothing" defaults, so an
+        // NVIDIA/Intel card is no longer treated as if it were an R7 260X.
+        if (getFeatures2) {
+            VkPhysicalDeviceFeatures2 f2{}; f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            VkPhysicalDeviceVulkan12Features v12{}; v12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+            VkPhysicalDeviceShaderFloat16Int8Features f16i8{}; f16i8.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
+            VkPhysicalDeviceVulkan11Features v11{}; v11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+            VkPhysicalDevice8BitStorageFeatures s8{}; s8.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES;
+            VkPhysicalDeviceVulkan13Features v13{}; v13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+            if (api13) { v13.pNext = f2.pNext; f2.pNext = &v13; }
+            if (api12) { v12.pNext = f2.pNext; f2.pNext = &v12; }
+            if (api11) { v11.pNext = f2.pNext; f2.pNext = &v11; }
+            s8.pNext = f2.pNext; f2.pNext = &s8;
+            f16i8.pNext = f2.pNext; f2.pNext = &f16i8;
+            getFeatures2(pd, &f2);
+            c.realFloat16 = (api12 ? v12.shaderFloat16 : f16i8.shaderFloat16) == VK_TRUE;
+            c.realInt16 = f2.features.shaderInt16 == VK_TRUE;
+            c.realFloat64 = f2.features.shaderFloat64 == VK_TRUE;
+            c.realInt64 = f2.features.shaderInt64 == VK_TRUE;
+            c.realStorage16 = (api11 ? v11.storageBuffer16BitAccess : VK_FALSE) == VK_TRUE ||
+                              v11.storageInputOutput16 == VK_TRUE;
+            c.realStorage8 = s8.storageBuffer8BitAccess == VK_TRUE;
+            if (api13) c.realDotProduct = v13.shaderIntegerDotProduct == VK_TRUE;
+            c.capsProbed = true;
+        }
+        c.realMesh = HasExt(exts, "VK_EXT_mesh_shader") || HasExt(exts, "VK_NV_mesh_shader");
 
         LogLine("RT feature probe: AS=%u AS_UAB=%u BDA=%u DescriptorIndexingMin=%u RTP=%u RTP_Indirect=%u RTP_Culling=%u RQ=%u SPIRV14=%u",
             c.featureAS, c.featureASUpdateAfterBind, c.featureBDA, c.featureDescriptorIndexing,
@@ -444,6 +523,9 @@ namespace {
         RtDeviceCaps result = inserted.first->second;
         ReleaseSRWLockExclusive(&g_rtCapsLock);
         if (inserted.second) {
+            LogLine("GPU SHADER PROFILE: Float16=%u Int16=%u DotProduct=%u Float64=%u Int64=%u Storage16=%u Storage8=%u Mesh=%u (probed=%u)",
+                result.realFloat16, result.realInt16, result.realDotProduct, result.realFloat64,
+                result.realInt64, result.realStorage16, result.realStorage8, result.realMesh, result.capsProbed);
             LogLine("GPU RT PROFILE: tier=%s API=%u.%u AS(ext=%u feature=%u native=%u virtual=%u) RTP(ext=%u feature=%u native=%u virtual=%u) RQ(ext=%u feature=%u native=%u virtual=%u)",
                 RtTierName(result.tier), VK_API_VERSION_MAJOR(result.apiVersion), VK_API_VERSION_MINOR(result.apiVersion),
                 result.extAS, result.featureAS, result.nativeAS, result.virtualAS,
@@ -470,6 +552,11 @@ namespace {
     void RegisterActiveRtDevice(VkDevice device, const RtDeviceCaps& c) {
         if (!device) return;
         ActiveRtDevice a{};
+        a.hwProbed = c.capsProbed;
+        a.hwFloat16 = c.realFloat16;
+        a.hwInt16 = c.realInt16;
+        a.hwDotProduct = c.realDotProduct;
+        a.hwMesh = c.realMesh;
         a.nativeAS = c.nativeAS && !c.virtualAS;
         a.nativeRTP = c.nativeRTP && !c.virtualRTP;
         a.nativeRQ = c.nativeRQ && !c.virtualRQ;
@@ -835,6 +922,41 @@ namespace {
         reinterpret_cast<VkBool32*>(reinterpret_cast<uint8_t*>(node) + 16)[index] = VK_TRUE;
     }
 
+    inline void ClearBool(void* node, size_t index) {
+        reinterpret_cast<VkBool32*>(reinterpret_cast<uint8_t*>(node) + 16)[index] = VK_FALSE;
+    }
+
+    // Uniform shader feature profile.
+    //
+    // The game compiles its shader permutations from the feature bits the driver
+    // reports. If a GTX 1060 says "shaderInt16 = yes" while the R7 260X says "no",
+    // the game emits a DIFFERENT module for the same material; the file name
+    // spv_<hash of the original>.spv can then never match and the replacement
+    // (with the working lighting) is silently skipped.
+    //
+    // Pinning the game-visible booleans to the profile of the reference card makes
+    // every GPU request the same shader set, so one spv_replace folder is valid
+    // everywhere. Only booleans are pinned (never sizes/limits), so nothing can
+    // become inconsistent: the game simply does not ask for variants it does not
+    // need. On the reference GCN2 card the pinned values already equal the real
+    // ones, so its behaviour is unchanged.
+    bool g_uniformProfileLogged = false;
+
+    void ApplyUniformShaderProfile(VkPhysicalDeviceFeatures* core) {
+        if (!core || !UniformShaderProfileEnabled()) return;
+        bool changed = false;
+        // Reference profile: no 16-bit integers, no 64-bit ALU, no 8-bit storage,
+        // no dot product, no float64. (float16 on/off is handled by the existing
+        // spoof below: the reference build always reported shaderFloat16 = true.)
+        if (core->shaderInt16)  { core->shaderInt16 = VK_FALSE;  changed = true; }
+        if (core->shaderInt64)  { core->shaderInt64 = VK_FALSE;  changed = true; }
+        if (core->shaderFloat64){ core->shaderFloat64 = VK_FALSE; changed = true; }
+        if (changed && !g_uniformProfileLogged) {
+            g_uniformProfileLogged = true;
+            LogLine("SPOOF: uniform shader profile - cleared shaderInt16/shaderInt64/shaderFloat64 so this GPU requests the same shader variants as the reference card");
+        }
+    }
+
     void FixupFeaturesChain(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2* f2) {
         const RtDeviceCaps rtCaps = GetRtDeviceCaps(pd);
         auto* node = reinterpret_cast<VkBaseOutStructure*>(f2->pNext);
@@ -853,8 +975,17 @@ namespace {
                 if (!f->shaderFloat16 && FirstTime("spoof:fp16"))
                     LogLine("SPOOF: Vulkan12Features.shaderFloat16 0 -> 1 (will rewrite fp16 shaders to fp32)");
                 f->shaderFloat16 = VK_TRUE;
+                if (UniformShaderProfileEnabled()) {
+                    // 8-bit storage / dot product change the shader variants the game
+                    // asks for; pin them to the reference profile.
+                    f->shaderInt8 = VK_FALSE;
+                    f->storageBuffer8BitAccess = VK_FALSE;
+                    f->uniformAndStorageBuffer8BitAccess = VK_FALSE;
+                    f->storagePushConstant8 = VK_FALSE;
+                }
             } else if (s == ST_FLOAT16_INT8_FEAT) {
                 auto* f = reinterpret_cast<VkPhysicalDeviceShaderFloat16Int8Features*>(node);
+                if (UniformShaderProfileEnabled()) f->shaderInt8 = VK_FALSE;
                 if (FirstTime("real:f16i8"))
                     LogLine("REAL ShaderFloat16Int8Features: shaderFloat16=%u shaderInt8=%u", f->shaderFloat16, f->shaderInt8);
                 f->shaderFloat16 = VK_TRUE;
@@ -864,6 +995,14 @@ namespace {
                     LogLine("REAL Vulkan11Features: storageBuffer16BitAccess=%u uniformAndStorageBuffer16BitAccess=%u storagePushConstant16=%u storageInputOutput16=%u multiview=%u shaderDrawParameters=%u",
                         f->storageBuffer16BitAccess, f->uniformAndStorageBuffer16BitAccess,
                         f->storagePushConstant16, f->storageInputOutput16, f->multiview, f->shaderDrawParameters);
+                if (UniformShaderProfileEnabled()) {
+                    // 16-bit storage changes how a shader packs data, so it also changes
+                    // the module the game compiles. Pin it to the reference profile.
+                    f->storageBuffer16BitAccess = VK_FALSE;
+                    f->uniformAndStorageBuffer16BitAccess = VK_FALSE;
+                    f->storagePushConstant16 = VK_FALSE;
+                    f->storageInputOutput16 = VK_FALSE;
+                }
             } else if (s == ST_VULKAN13_FEATURES) {
                 auto* f = reinterpret_cast<VkPhysicalDeviceVulkan13Features*>(node);
                 if (FirstTime("real:vk13features"))
@@ -873,6 +1012,7 @@ namespace {
                 f->dynamicRendering = VK_TRUE;
                 f->synchronization2 = VK_TRUE;
                 f->maintenance4 = VK_TRUE;
+                if (UniformShaderProfileEnabled()) f->shaderIntegerDotProduct = VK_FALSE;
             } else if (s == ST_DYNAMIC_RENDERING_FEAT) {
                 if (FirstTime("real:dynrendfeat"))
                     LogLine("REAL DynamicRenderingFeatures: dynamicRendering=%u",
@@ -882,6 +1022,10 @@ namespace {
                 SetBool(node, 0);
             } else if (s == ST_MAINTENANCE4_FEAT) {
                 SetBool(node, 0);
+            } else if (UniformShaderProfileEnabled() && s == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES) {
+                memset(reinterpret_cast<uint8_t*>(node) + 16, 0, sizeof(VkPhysicalDevice8BitStorageFeatures) - 16);
+            } else if (UniformShaderProfileEnabled() && s == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES) {
+                memset(reinterpret_cast<uint8_t*>(node) + 16, 0, sizeof(VkPhysicalDevice16BitStorageFeatures) - 16);
             } else if (rtCaps.virtualAS && s == ST_AS_FEATURES) {
                 SetBool(node, 0); SetBool(node, 4);
                 if (FirstTime("spoof:asfeat")) LogLine("SPOOF: AccelerationStructureFeatures = TRUE");
@@ -1840,7 +1984,17 @@ namespace {
         float brightness = 1.0f;   // post-process gain on the final image (1.0 = off)
         int tryVariants = 1;       // if the driver crashes/rejects a module, retry with workaround variants
         int keepCode = 1;
-        int traceReplacementShaders = 0; // bounded tracing for modules loaded from spv_replace          // remember each module's SPIR-V so failed pipelines can be dumped
+        int traceReplacementShaders = 0; // bounded tracing for modules loaded from spv_replace
+        // Which capabilities this machine really has. Replacing hardware denial with
+        // "DenyFloat16=1" forced every GPU to behave like GCN2: capable cards got the
+        // SAME denied/fake modules, so spv_replace hashes (computed from the game's
+        // real modules on GCN2) never matched on NVIDIA/Intel and lighting asset
+        // shaders stayed fake -> dark interiors. With these switches on, every GPU
+        // classifies modules the same way (denial only when the driver really lacks
+        // the feature), which makes the replacement map portable.
+        int followHardwareCaps = 1; // honour the real driver feature bits instead of the fixed deny list
+        int structureMatchFallback = 1; // second-chance matching when the byte hash differs
+        int forceVirtualRtByDefault = 0; // 1 = treat every GPU as "no RT at all" (old, uniform behaviour)
         int dumpSamples = 0;       // dump N working compute shaders of two kinds (for comparison with crashing ones)
         int serializeCompile = 1; // one thread at a time inside driver shader/pipeline compilation
         int promoteFloat16 = 0;   // старый промоутер - ВЫКЛ (ломает layout буферов)
@@ -1870,6 +2024,16 @@ namespace {
         return h;
     }
     std::unordered_map<uint64_t, std::wstring>* g_replMap = nullptr;
+    // ---- structure-aware replacement index (see spvrw::StructuralSignature) ----
+    // Declared here because the configuration loader (below) has to invalidate the
+    // index when it re-reads spv_replace.
+    std::unordered_map<std::string, std::wstring>* g_replStructMap = nullptr;
+    std::unordered_set<std::string>* g_replStructAmbiguous = nullptr;
+    std::unordered_map<uint64_t, std::wstring>* g_replMatchCache = nullptr;
+    SRWLOCK g_replStructLock = SRWLOCK_INIT;
+    volatile LONG g_replStructState = 0;   // 0 = not built, 2 = ready
+    volatile LONG g_replStructHits = 0;
+    volatile LONG g_replHashHits = 0;
     void ScanReplacements(const wchar_t* iniPath) {
         wchar_t dir[2048]{};
         wcsncpy_s(dir, iniPath, _TRUNCATE);
@@ -1964,6 +2128,10 @@ namespace {
         g_spvCfg.serializeCompile = rd(L"SerializeCompile", 1);
         g_spvCfg.keepCode = rd(L"KeepShaderCode", 1);
         g_spvCfg.traceReplacementShaders = rd(L"TraceReplacementShaders", 0);
+        g_spvCfg.followHardwareCaps = rd(L"FollowHardwareCaps", 1);
+        g_spvCfg.structureMatchFallback = rd(L"StructureMatchFallback", 1);
+        InterlockedExchange(&g_uniformShaderProfile, rd(L"UniformShaderProfile", 0));
+        g_spvCfg.forceVirtualRtByDefault = rd(L"ForceVirtualRt", 0);
         g_spvCfg.tryVariants = rd(L"TryVariants", 1);
         {
             wchar_t bb[64]{};
@@ -2017,7 +2185,21 @@ namespace {
         rdList(L"DenyComputeCaps", g_spvCfg.denyComputeCaps, g_spvCfg.nDenyComputeCaps);
         rdList(L"DenyAnyCaps", g_spvCfg.denyAnyCaps, g_spvCfg.nDenyAnyCaps);
         rdList(L"DenyComputeAllCaps", g_spvCfg.denyComputeAll, g_spvCfg.nDenyComputeAll);
-        if (g_spvCfg.useReplacements) ScanReplacements(path);
+        if (g_spvCfg.useReplacements) {
+            ScanReplacements(path);
+            // The ini (and therefore spv_replace) may be re-read; drop the derived
+            // indexes so they are rebuilt from the folder that is on disk now.
+            // Only invalidated afterwards: the lazy builders below hold the lock while
+            // they publish g_replStructState = 2, so a concurrent lookup can never see
+            // "ready" together with a half-built index.
+            InterlockedExchange(&g_replStructState, 0);
+            delete g_replStructMap;         g_replStructMap = nullptr;
+            delete g_replStructAmbiguous;   g_replStructAmbiguous = nullptr;
+            delete g_replMatchCache;        g_replMatchCache = nullptr;
+        }
+        LogLine("SPIRV: FollowHardwareCaps=%d StructureMatchFallback=%d UniformShaderProfile=%d ForceVirtualRt=%d",
+            g_spvCfg.followHardwareCaps, g_spvCfg.structureMatchFallback,
+            (int)g_uniformShaderProfile, g_spvCfg.forceVirtualRtByDefault);
         LogLine("SPIRV config (%ls): DenyFloat16=%d DenyInt16=%d DenyDotProduct=%d DenyRayTracing=%d RewriteRayQuery=%d DenyMesh=%d PatchVersion=%d LogAll=%d Serialize=%d Catch=%d DenyComputeAll=%d caps Brightness=%.2f",
             path, g_spvCfg.denyFloat16, g_spvCfg.denyInt16, g_spvCfg.denyDotProduct,
             g_spvCfg.denyRayTracing, g_spvCfg.rewriteRayQuery, g_spvCfg.denyMesh, g_spvCfg.patchVersion, g_spvCfg.logAll,
@@ -4396,7 +4578,268 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         }
         return true;
     }
+
+    // -----------------------------------------------------------------------
+    // Structure-aware replacement keys (vendor independent).
+    //
+    // spv_replace files are named after the FNV-1a hash of the module the game
+    // handed to the proxy. That byte hash is only stable if the GAME produces
+    // exactly the same bytes on every machine. In practice it does not: the
+    // game asks the driver which features exist and bakes the answer into the
+    // shader variant it compiles (fp16 on/off, RT on/off, subgroup size, ...).
+    // On the reference R7 260X the proxy reports "no RT / no fp16", so the game
+    // emits the fallback variants the replacements were made from. On a GTX
+    // 1060/1080 the driver really reports RT/fp16, the game emits different
+    // modules, the hash never matches and spv_replace is silently not applied.
+    //
+    // Fix: classify every module the same way on every GPU (see the
+    // FollowHardwareCaps handling) AND accept a replacement when the module is
+    // instruction-for-instruction the same apart from ids, layout decorations,
+    // enum/type widths and the SPIR-V header. Ray tracing instructions are
+    // ignored as well, so a RayQuery variant of the same shader still finds its
+    // non-RT replacement (the replacement is the one that is actually wanted).
+    // -----------------------------------------------------------------------
+    // Ray tracing / mesh capabilities that only exist on some driver profiles.
+    inline bool IsRayTracingCapability(uint32_t cap) {
+        return cap == 4472 || cap == 4479 || cap == 5340 || cap == 5341 || cap == 5342;
+    }
+
+    inline bool IsRayTracingOpForSignature(uint32_t op) {
+        // OpTypeAccelerationStructureKHR / OpTypeRayQueryKHR
+        if (op == 5341 || op == 4472) return true;
+        // OpTraceRayKHR, OpExecuteCallableKHR, OpConvertUToAccelerationStructureKHR
+        if (op == 4445 || op == 4446 || op == 4447) return true;
+        // RayQueryKHR instructions (4473..4479)
+        if (op >= 4473 && op <= 4479) return true;
+        // OpRayQueryGetRayTMinKHR / GetRayFlagsKHR / GetWorldRayOriginKHR / GetWorldRayDirectionKHR
+        if (op >= 6016 && op <= 6032) return true;
+        return false;
+    }
+
+    // True for instructions that describe a module's interface / declarations.
+    // Their enum values (formats, builtin numbers, execution modes, decorator
+    // numbers) vary between driver-capability profiles, so they are reduced to
+    // "shape" only. Function bodies are kept verbatim (minus ids).
+    inline bool IsDeclarationOpForSignature(uint32_t op) {
+        switch (op) {
+        case 10:  // OpExtension
+        case 11:  // OpExtInstImport
+        case 12:  // OpExtInst
+        case 15:  // OpEntryPoint
+        case 16:  // OpExecutionMode
+        case 17:  // OpCapability
+        case 19:  // OpTypeVoid
+        case 20:  // OpTypeBool
+        case 21:  // OpTypeInt
+        case 22:  // OpTypeFloat
+        case 23:  // OpTypeVector
+        case 24:  // OpTypeMatrix
+        case 25:  // OpTypeImage
+        case 26:  // OpTypeSampler
+        case 27:  // OpTypeSampledImage
+        case 28:  // OpTypeArray
+        case 29:  // OpTypeRuntimeArray
+        case 30:  // OpTypeStruct
+        case 31:  // OpTypeOpaque
+        case 32:  // OpTypePointer
+        case 33:  // OpTypeFunction
+        case 71:  // OpDecorate
+        case 72:  // OpMemberDecorate
+        case 73:  // OpDecorationGroup
+        case 74:  // OpGroupDecorate
+        case 75:  // OpGroupMemberDecorate
+        case 331: // OpDecorateId
+        case 5632: // OpDecorateString
+        case 5633: // OpMemberDecorateString
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    // Structural signature: same key <=> same program shape on any GPU.
+    inline std::string StructuralSignature(const uint32_t* w, size_t n, size_t* instructionCount = nullptr,
+                                           bool* hasRayTracing = nullptr) {
+        std::string sig;
+        if (instructionCount) *instructionCount = 0;
+        if (hasRayTracing) *hasRayTracing = false;
+        if (!w || n < 5 || w[0] != 0x07230203u) return sig;
+
+        std::unordered_map<uint32_t, uint32_t> idMap;   // original id -> stable id
+        uint32_t nextId = 1;
+        auto mapId = [&](uint32_t id) -> uint32_t {
+            if (id == 0) return 0;
+            auto it = idMap.find(id);
+            if (it != idMap.end()) return it->second;
+            idMap[id] = nextId;
+            return nextId++;
+        };
+
+        sig.reserve(n * 3);
+        char buf[48];
+
+        // ---- main pass -------------------------------------------------------
+        for (size_t i = 5; i < n;) {
+            const uint32_t wc = w[i] >> 16, op = w[i] & 0xFFFFu;
+            if (wc == 0 || i + wc > n) break;
+
+            if (IsRayTracingOpForSignature(op)) {
+                if (hasRayTracing) *hasRayTracing = true;
+                if (instructionCount) ++*instructionCount;
+                i += wc;
+                continue;                               // ignore RT-only code entirely
+            }
+            if (op == 10 || op == 11) { i += wc; continue; }   // extension/import strings
+            if (op == 17 && wc >= 2 && IsRayTracingCapability(w[i + 1])) {
+                // OpCapability RayQueryKHR / RayTracingKHR / RayTracingNV: the module
+                // declares RT support. Ignored here so an RT-enabled variant of a
+                // shader still matches its RT-free replacement.
+                if (hasRayTracing) *hasRayTracing = true;
+                i += wc;
+                continue;
+            }
+            sprintf_s(buf, sizeof(buf), "|%u:%u", op, wc);
+            sig += buf;
+            if (op == 15 && wc >= 2) {
+                // OpEntryPoint: the execution model is identical on every GPU, so it
+                // stays part of the key (a fragment shader must never match a compute
+                // replacement). Ray-tracing stages have no equivalent, so they are
+                // never matched at all.
+                const uint32_t model = w[i + 1];
+                if (model >= 5313 && model <= 5321) return std::string();
+                sprintf_s(buf, sizeof(buf), "E%u", model);
+                sig += buf;
+            }
+
+            if (op == 42 || op == 43 || op == 44 || op == 45) {
+                // OpConstant/OpConstantTrue/OpConstantFalse/OpConstantComposite:
+                // ids may embed 16-bit or 64-bit encodings that differ by profile.
+                // Keep the type only, drop the literal payload.
+                sig += "#T";
+                ForEachId(w + i, op, wc, [&](size_t idx, char role) {
+                    if (role == 'T') { sig += std::to_string(mapId(w[i + idx])); }
+                });
+            } else if (IsDeclarationOpForSignature(op)) {
+                // Keep ids (mapped) and drop every enum / literal number.
+                ForEachId(w + i, op, wc, [&](size_t idx, char role) {
+                    if (role == 'T' || role == 'R' || role == 'I') {
+                        sig += role;
+                        sig += std::to_string(mapId(w[i + idx]));
+                    } else {
+                        sig += 'L';                     // literal placeholder
+                    }
+                });
+            } else if (op == 59) {
+                // OpVariable: storage class matters (interface), type/result ids do not.
+                sig += "#S";
+                ForEachId(w + i, op, wc, [&](size_t idx, char role) {
+                    if (role == 'T' || role == 'R') { sig += role; sig += std::to_string(mapId(w[i + idx])); }
+                    else sig += 'L';
+                });
+            } else {
+                // Function body / control flow: ids and width-bearing literals only.
+                ForEachId(w + i, op, wc, [&](size_t idx, char role) {
+                    if (role == 'T' || role == 'R' || role == 'I') {
+                        sig += std::to_string(mapId(w[i + idx]));
+                        sig += ',';
+                    }
+                });
+            }
+
+            if (instructionCount) ++*instructionCount;
+            i += wc;
+        }
+
+        return sig;
+    }
 }
+
+    // -----------------------------------------------------------------------
+    // Second-chance replacement lookup.
+    //
+    // Primary key: FNV-1a of the exact module bytes the game supplied (works
+    // when the game generates byte-identical modules, e.g. the reference GCN2
+    // machine the replacements were made on).
+    // Secondary key: spvrw::StructuralSignature, which ignores ids, decorations,
+    // enum literals, extension strings and ray-tracing code. This makes the same
+    // spv_replace folder work on NVIDIA/Intel/AMD cards whose driver-capability
+    // profile makes the game emit a slightly different but equivalent module.
+    // -----------------------------------------------------------------------
+    void BuildStructuralReplacementIndexLocked() {
+        auto* index = new std::unordered_map<std::string, std::wstring>();
+        auto* ambiguous = new std::unordered_set<std::string>();
+        size_t unreadable = 0, skipped = 0, duplicates = 0;
+        if (g_replMap) {
+            for (const auto& kv : *g_replMap) {
+                std::vector<uint32_t> words;
+                if (!ReadReplacement(kv.second, words)) { ++unreadable; continue; }
+                std::string err;
+                if (!ValidateReplacementEnvelope(words, err)) { ++unreadable; continue; }
+                size_t insts = 0;
+                bool hasRt = false;
+                const std::string sig = spvrw::StructuralSignature(words.data(), words.size(), &insts, &hasRt);
+                if (sig.empty() || insts < 8) { ++skipped; continue; }
+                auto ins = index->emplace(sig, kv.second);
+                if (!ins.second) {
+                    // Two different originals reduce to the same shape. Substituting one for
+                    // the other could change behaviour, so such shapes are never matched.
+                    if (ambiguous->insert(sig).second) ++duplicates;
+                }
+            }
+        }
+        for (const std::string& sig : *ambiguous) index->erase(sig);
+
+        g_replStructMap = index;
+        g_replStructAmbiguous = ambiguous;
+        LogLine("SPIRV: structural replacement index built: %zu unique signature(s), %zu ambiguous (ignored), %zu unreadable, %zu skipped",
+            g_replStructMap->size(), ambiguous->size(), unreadable, skipped);
+        (void)duplicates;
+    }
+
+    // Returns the replacement path for a module whose byte hash is not in the map.
+    bool LookupStructuralReplacement(const uint32_t* code, size_t nWords, std::wstring& outPath) {
+        if (!g_spvCfg.structureMatchFallback || !g_replMap || g_replMap->empty()) return false;
+        if (!code || nWords < 5) return false;
+
+        if (InterlockedCompareExchange(&g_replStructState, 0, 0) != 2) {
+            AcquireSRWLockExclusive(&g_replStructLock);
+            if (g_replStructState != 2) { BuildStructuralReplacementIndexLocked(); g_replStructState = 2; }
+            ReleaseSRWLockExclusive(&g_replStructLock);
+        }
+        if (!g_replStructMap || g_replStructMap->empty()) return false;
+
+        size_t insts = 0;
+        bool hasRt = false;
+        const std::string sig = spvrw::StructuralSignature(code, nWords, &insts, &hasRt);
+        if (sig.empty() || insts < 8) return false;
+
+        AcquireSRWLockShared(&g_replStructLock);
+        auto it = g_replStructMap->find(sig);
+        const bool found = it != g_replStructMap->end();
+        if (found) outPath = it->second;
+        ReleaseSRWLockShared(&g_replStructLock);
+        return found;
+    }
+
+    // Learned hash -> file mapping. Once a module with hash Y has been matched
+    // structurally to a replacement we remember it, so the signature is computed
+    // only once per distinct module instead of once per pipeline permutation.
+    bool LookupCachedReplacement(uint64_t hash, std::wstring& outPath) {
+        if (!g_replMatchCache) return false;
+        AcquireSRWLockShared(&g_replStructLock);
+        auto it = g_replMatchCache->find(hash);
+        const bool found = it != g_replMatchCache->end();
+        if (found) outPath = it->second;
+        ReleaseSRWLockShared(&g_replStructLock);
+        return found;
+    }
+
+    void RememberReplacementMatch(uint64_t hash, const std::wstring& path) {
+        AcquireSRWLockExclusive(&g_replStructLock);
+        if (!g_replMatchCache) g_replMatchCache = new std::unordered_map<uint64_t, std::wstring>();
+        (*g_replMatchCache)[hash] = path;
+        ReleaseSRWLockExclusive(&g_replStructLock);
+    }
 
     // ---- SPIR-V module info ---------------------------------------------------
     struct SpvInfo {
@@ -4437,7 +4880,34 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         }
     }
 
-    SpvInfo AnalyzeSpirv(const uint32_t* w, size_t nWords, bool nativeRTP, bool nativeRQ) {
+    // Hardware capability view used to classify a module. It is filled from the
+    // driver's real feature bits so that each GPU is judged by what it can
+    // actually run instead of by a fixed "GCN2 has nothing" list.
+    struct ShaderCaps {
+        bool probed = false;      // driver bits were queried successfully
+        bool float16 = false;
+        bool int16 = false;
+        bool dotProduct = false;
+        bool mesh = false;
+        bool rayQuery = false;
+        bool rayPipeline = false;
+    };
+
+    // Capability view for the device that owns the shader module. Uses the record
+    // captured in vkCreateDevice, so it is correct even with several GPUs present.
+    ShaderCaps GetShaderCaps(const ActiveRtDevice& a) {
+        ShaderCaps s;
+        s.probed = a.hwProbed;
+        s.float16 = a.hwFloat16;
+        s.int16 = a.hwInt16;
+        s.dotProduct = a.hwDotProduct;
+        s.mesh = a.hwMesh;
+        s.rayQuery = a.nativeRQ;
+        s.rayPipeline = a.nativeRTP;
+        return s;
+    }
+
+    SpvInfo AnalyzeSpirv(const uint32_t* w, size_t nWords, bool nativeRTP, bool nativeRQ, const ShaderCaps& hw) {
         SpvInfo info;
         if (!w || nWords < 5 || w[0] != 0x07230203u) { info.reason = "not SPIR-V"; return info; }
         info.version = w[1];
@@ -4474,9 +4944,31 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
             }
             i += wc;
         }
-        if (g_spvCfg.denyFloat16 && f16)    { info.deny = true; info.denyOther = true; info.reason += "Float16 "; }
-        if (g_spvCfg.denyInt16 && i16)      { info.deny = true; info.denyOther = true; info.reason += "Int16 "; }
-        if (g_spvCfg.denyDotProduct && dot) { info.deny = true; info.denyOther = true; info.reason += "DotProduct "; }
+        // ---- capability policy -------------------------------------------------
+        // FollowHardwareCaps (default): a module is denied only when the driver
+        // genuinely lacks the feature it needs, so the game's shader set (and the
+        // spv_replace hash list built from it) is identical on GCN2, Pascal/Turing
+        // and Intel instead of depending on the INI's GCN2 defaults.
+        // FollowHardwareCaps=0 restores the legacy INI-driven behaviour.
+        const bool follow = g_spvCfg.followHardwareCaps != 0 && hw.probed;
+        // Deny = "the INI asks for it" AND "the driver really cannot run it".
+        //
+        // Why an AND (and not "just ask the driver"): the INI flags are the user's
+        // explicit choice for THIS machine. Using the AND means the set of blocked
+        // modules can only ever SHRINK compared to older builds, so the already
+        // working reference card keeps exactly its previous behaviour, while a card
+        // that reports a missing feature as supported stops receiving fake modules.
+        // With the AND, the deny decision for every capability the INI blocks becomes
+        // identical on GCN2 / Pascal / Turing / Intel ("this feature is unavailable
+        // here"), which is what makes one spv_replace folder valid on all of them.
+        // If the driver could not be probed, the INI value is used as-is (legacy).
+        const bool denyF16      = (g_spvCfg.denyFloat16 != 0)    && (!follow || !hw.float16);
+        const bool denyI16      = (g_spvCfg.denyInt16 != 0)      && (!follow || !hw.int16);
+        const bool denyDot      = (g_spvCfg.denyDotProduct != 0) && (!follow || !hw.dotProduct);
+        const bool denyMeshHere = (g_spvCfg.denyMesh != 0)       && (!follow || !hw.mesh);
+        if (denyF16 && f16)    { info.deny = true; info.denyOther = true; info.reason += "Float16 "; }
+        if (denyI16 && i16)    { info.deny = true; info.denyOther = true; info.reason += "Int16 "; }
+        if (denyDot && dot)    { info.deny = true; info.denyOther = true; info.reason += "DotProduct "; }
         // Do not blanket-deny RT on capable GPUs. In Hybrid, native pipeline
         // stages stay native while only unsupported RayQuery is rewritten.
         if (rt) {
@@ -4492,7 +4984,7 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
                     info.denyOther = true;
             }
         }
-        if (g_spvCfg.denyMesh && mesh)      { info.deny = true; info.denyOther = true; info.reason += "Mesh "; }
+        if (denyMeshHere && mesh)           { info.deny = true; info.denyOther = true; info.reason += "Mesh "; }
         info.rqOnly = rqCap && !rtHard && !nativeRQ && GetRtCompatMode() != RT_MODE_NATIVE;
         for (uint32_t c : capIds) {
             for (int k = 0; k < g_spvCfg.nDenyAnyCaps; ++k)
@@ -6052,28 +6544,64 @@ vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* pInfo,
     // Replacement selection happens BEFORE capability analysis and compatibility
     // lowering. Previously a replacement was loaded after analysis and blindly
     // cleared si.deny; the chosen SPIR-V could therefore bypass every safety check.
+    //
+    // Two lookup strategies, in order:
+    //   1. exact byte hash  - works when the game emits identical modules (the
+    //      reference GCN2 machine the spv_replace folder was built on);
+    //   2. structure match  - makes the SAME folder work on NVIDIA/Intel/AMD cards
+    //      whose capability profile makes the game emit an equivalent module with
+    //      different ids/enums. Without this, spv_replace is silently skipped on
+    //      those GPUs and the replacement lighting never appears.
     if (g_replMap && !g_replMap->empty()) {
+        std::wstring chosenPath;
+        bool havePath = false;
+        const char* matchKind = "hash";
+
         const auto it = g_replMap->find(originalHash);
         if (it != g_replMap->end()) {
+            chosenPath = it->second;
+            havePath = true;
+            InterlockedIncrement(&g_replHashHits);
+        } else if (LookupCachedReplacement(originalHash, chosenPath)) {
+            havePath = true;
+            matchKind = "hash-cached";
+        } else if (LookupStructuralReplacement(originalCode, nWords, chosenPath)) {
+            havePath = true;
+            matchKind = "structure";
+            RememberReplacementMatch(originalHash, chosenPath);
+            InterlockedIncrement(&g_replStructHits);
+            static volatile LONG structLogs = 0;
+            if (InterlockedIncrement(&structLogs) <= 20)
+                LogLine("SPIRV: shader replacement matched by STRUCTURE hash=%016llX (byte hash differs on this GPU); module is equivalent to the original",
+                    static_cast<unsigned long long>(originalHash));
+        }
+
+        if (havePath) {
             std::string replacementError;
-            if (ReadReplacement(it->second, replacement) &&
+            if (ReadReplacement(chosenPath, replacement) &&
                 ValidateReplacementEnvelope(replacement, replacementError)) {
                 code = replacement.data();
                 nWords = replacement.size();
                 didReplace = true;
-                LogLine("SPIRV: shader replacement ACCEPTED hash=%016llX (%zu -> %zu words); capability analysis will run on replacement",
-                    static_cast<unsigned long long>(originalHash), originalBytes / sizeof(uint32_t), nWords);
+                LogLine("SPIRV: shader replacement ACCEPTED (%s) hash=%016llX (%zu -> %zu words); capability analysis will run on replacement",
+                    matchKind, static_cast<unsigned long long>(originalHash), originalBytes / sizeof(uint32_t), nWords);
             } else {
                 if (replacementError.empty()) replacementError = "file read failed or SPIR-V magic invalid";
                 replacement.clear();
-                LogLine("SPIRV: shader replacement REJECTED hash=%016llX: %s; original module retained",
-                    static_cast<unsigned long long>(originalHash), replacementError.c_str());
+                LogLine("SPIRV: shader replacement REJECTED (%s) hash=%016llX: %s; original module retained",
+                    matchKind, static_cast<unsigned long long>(originalHash), replacementError.c_str());
             }
+        } else {
+            static volatile LONG misses = 0;
+            if (InterlockedIncrement(&misses) <= 15)
+                LogLine("SPIRV: no replacement for hash=%016llX (neither the byte hash nor the structural signature matched spv_replace)",
+                    static_cast<unsigned long long>(originalHash));
         }
     }
 
     const ActiveRtDevice activeRt = GetActiveRtDevice(device);
-    SpvInfo si = AnalyzeSpirv(code, nWords, activeRt.nativeRTP, activeRt.nativeRQ);
+    const ShaderCaps hwCaps = GetShaderCaps(activeRt);
+    SpvInfo si = AnalyzeSpirv(code, nWords, activeRt.nativeRTP, activeRt.nativeRQ, hwCaps);
     si.originalHash = originalHash;
     si.replacement = didReplace;
     static volatile LONG seen = 0;
@@ -8306,6 +8834,17 @@ void LogD5DeviceCapabilities(VkPhysicalDevice pd, const VkPhysicalDeviceFeatures
     }
 }
 
+// Legacy entry point: some engines read the core feature set from here (or mix it
+// with Features2), so the uniform profile has to be applied to both.
+extern "C" VKAPI_ATTR void VKAPI_CALL
+vkGetPhysicalDeviceFeatures(VkPhysicalDevice pd, VkPhysicalDeviceFeatures* pFeatures) {
+    auto real = RealExport<PFN_vkGetPhysicalDeviceFeatures>("vkGetPhysicalDeviceFeatures");
+    if (!real || !pFeatures) return;
+    LoadSpvConfig();
+    real(pd, pFeatures);
+    ApplyUniformShaderProfile(pFeatures);
+}
+
 extern "C" VKAPI_ATTR void VKAPI_CALL
 vkGetPhysicalDeviceFeatures2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2* pFeatures) {
     using Fn = PFN_vkGetPhysicalDeviceFeatures2;
@@ -8329,6 +8868,7 @@ vkGetPhysicalDeviceFeatures2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2* pFe
         real(pd, pFeatures);
     }
     LogD5DeviceCapabilities(pd, pFeatures);
+    ApplyUniformShaderProfile(&pFeatures->features);
     FixupFeaturesChain(pd, pFeatures);
 }
 
@@ -8473,6 +9013,7 @@ vkCreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo* pCreateInfo,
     if (ci.pEnabledFeatures) {
         localCore = *ci.pEnabledFeatures;
         ClampCoreFeatures(pd, &localCore, "pEnabledFeatures");
+        ApplyUniformShaderProfile(&localCore);
         ci.pEnabledFeatures = &localCore;
     }
 
@@ -8512,6 +9053,7 @@ vkCreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo* pCreateInfo,
             sv.bytes.assign(reinterpret_cast<uint8_t*>(node), reinterpret_cast<uint8_t*>(node) + sizeof(VkPhysicalDeviceFeatures2));
             saved.push_back(std::move(sv));
             ClampCoreFeatures(pd, &f2->features, "Features2.features");
+            ApplyUniformShaderProfile(&f2->features);
         } else {
             for (const ClampInfo& c : kClampable) {
                 if (c.sType == st) {
@@ -8644,6 +9186,8 @@ namespace {
             return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPhysicalDeviceProperties2);
         if (!strcmp(name, "vkGetPhysicalDeviceFeatures2") || !strcmp(name, "vkGetPhysicalDeviceFeatures2KHR"))
             return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPhysicalDeviceFeatures2);
+        if (!strcmp(name, "vkGetPhysicalDeviceFeatures"))
+            return reinterpret_cast<PFN_vkVoidFunction>(&vkGetPhysicalDeviceFeatures);
         if (!strcmp(name, "vkCreateDevice")) return reinterpret_cast<PFN_vkVoidFunction>(&vkCreateDevice);
         if (!strcmp(name, "vkQueueSubmit")) {
             if (FirstTime("sync-proc:vkQueueSubmit"))
