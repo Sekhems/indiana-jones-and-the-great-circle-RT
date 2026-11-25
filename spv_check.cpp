@@ -10,6 +10,7 @@
 // Build:  build_spv_check.bat   (needs MSVC only, no Vulkan SDK)
 // Usage:  spv_check.exe ["D:\path\to\spv_replace"]
 // ---------------------------------------------------------------------------
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>
@@ -23,21 +24,19 @@
 #include <vector>
 #include <algorithm>
 
-#define _TRUNCATE ((size_t)-1)
-static void sprintf_s(char* b, size_t n, const char* f, ...) { va_list a; va_start(a, f); vsnprintf(b, n, f, a); va_end(a); }
-static void _snprintf_s(char* b, size_t n, size_t, const char* f, ...) { va_list a; va_start(a, f); vsnprintf(b, n, f, a); va_end(a); }
-static void LogLine(const char* f, ...) { va_list a; va_start(a, f); vprintf(f, a); va_end(a); printf("\n"); }
+// Nothing is stubbed here on purpose: sprintf_s, _snprintf_s, SRWLOCK,
+// SRWLOCK_INIT and the Interlocked* helpers all come from the Windows headers,
+// exactly as they do in the proxy itself. Redefining them breaks the build
+// (C2556/C2371/C2491/C2169).
 
-// The locking primitives are not exercised by the matching code paths used here.
-#define SRWLOCK_INIT {0}
-typedef struct { int unused; } SRWLOCK;
-static void AcquireSRWLockShared(SRWLOCK*) {}
-static void ReleaseSRWLockShared(SRWLOCK*) {}
-static void AcquireSRWLockExclusive(SRWLOCK*) {}
-static void ReleaseSRWLockExclusive(SRWLOCK*) {}
-static long InterlockedExchange(volatile long* p, long v) { long o = *p; *p = v; return o; }
-static long InterlockedIncrement(volatile long* p) { return ++*p; }
-static long InterlockedCompareExchange(volatile long* p, long a, long b) { long o = *p; if (*p == b) *p = a; return o; }
+// Diagnostics: same role as in the DLL, but written to the console.
+static void LogLine(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    vprintf(format, args);
+    va_end(args);
+    printf("\n");
+}
 
 struct SpvOpDesc { uint16_t op; const char* kinds; };
 
