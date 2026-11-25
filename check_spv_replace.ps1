@@ -114,6 +114,10 @@ if ($noMatchAll -and $logStale) {
 Section 'Verdict on THIS machine (SPIRV SUMMARY / replacement ACCEPTED)'
 $summaries = @(Select-String -LiteralPath $log -Pattern 'SPIRV SUMMARY:')
 $liveHits  = @(Select-String -LiteralPath $log -Pattern 'SPIRV: replacement ACCEPTED \(')
+$structural = @(Select-String -LiteralPath $log -Pattern 'STRUCTURAL matching is in use')
+$hashHits   = @(Select-String -LiteralPath $log -Pattern 'ACCEPTED \(exact hash, not structure\)')
+Write-Host ("  accepted via byte hash : {0}" -f $hashHits.Count)
+Write-Host ("  accepted via structure  : {0}" -f $structural.Count) -ForegroundColor ($(if ($structural.Count) {'Green'} else {'Gray'}))
 if ($summaries.Count) {
     foreach ($m in ($summaries | Select-Object -Last 3)) { Write-Host ('  ' + $m.Line.Trim()) }
 } else {
@@ -124,8 +128,12 @@ foreach ($m in ($liveHits | Select-Object -First 5)) { Write-Host ('    ' + $m.L
 $portable = @($summaries | Where-Object { $_.Line -match 'PORTABLE PATH USED' })
 $hashOnly = @($summaries | Where-Object { $_.Line -match 'accepted by exact hash only' })
 $nothing  = @($summaries | Where-Object { $_.Line -match 'NOTHING ACCEPTED' })
-if ($portable.Count -or $liveHits.Count) {
-    Write-Host '  => RESULT: the folder is used through structural matching. This is the same path another GPU takes.' -ForegroundColor Green
+if ($structural.Count -or $portable.Count) {
+    Write-Host '  => RESULT: the STRUCTURAL path was used on this card - the same path another GPU takes.' -ForegroundColor Green
+} elseif ($hashHits.Count) {
+    Write-Host '  => RESULT: replacements are ACCEPTED, but by byte hash only - on this card the game' -ForegroundColor Yellow
+    Write-Host '     builds these modules exactly like the reference machine, so the structural path was' -ForegroundColor Yellow
+    Write-Host '     never needed. The folder is still portable (see the self-test above).' -ForegroundColor Yellow
 } elseif ($hashOnly.Count) {
     Write-Host '  => RESULT: only exact hashes matched, structural matching never fired on this card. Send the log.' -ForegroundColor Yellow
 } elseif ($nothing.Count) {

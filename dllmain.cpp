@@ -2034,6 +2034,7 @@ namespace {
     void RunReplacementSelfTest(int mode);
     // The hit counters live in spvrw; the shader path below has to bump them too.
     void NoteReplacementHit(bool exact, const char* how);
+    void NoteLookupStage(uint32_t stage);
     void ScanReplacements(const wchar_t* iniPath) {
         wchar_t dir[2048]{};
         wcsncpy_s(dir, iniPath, _TRUNCATE);
@@ -5450,7 +5451,6 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         }
 
         outPath = found;
-        InterlockedIncrement(&g_stageHit[StageBucket(fp.stage)]);
         if (how) *how = level;
         AcquireSRWLockExclusive(&g_replIndexLock);
         if (g_replIndex) g_replIndex->learned[hash] = found;
@@ -5473,7 +5473,16 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     // The running totals are logged a few times, because a process that is closed by the
     // task manager never reaches DllMain(DLL_PROCESS_DETACH) and would otherwise leave no
     // verdict in the log at all.
+    // Stage of the module currently being looked up, set by the shader path. Byte-hash
+    // hits never reach FindReplacement, so without this the per-stage table reported
+    // "0 replaced" for a stage where replacements were in fact accepted.
+    volatile LONG g_lookupStage = -1;
+
+    void NoteLookupStage(uint32_t stage) { g_lookupStage = StageBucket(stage); }
+
     void NoteReplacementHit(bool exact, const char* how) {
+        const long bucket = g_lookupStage;
+        if (bucket >= 0 && bucket < 8) InterlockedIncrement(&g_stageHit[bucket]);
         const long total = exact ? InterlockedIncrement(&g_replHitsExact)
                                  : InterlockedIncrement(&g_replHitsSimilar);
         if (total <= 5) {
@@ -5515,7 +5524,7 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
                     if (seen == 0) continue;
                     const char* verdict = (close > 0) ? "ACTION: a file almost matched"
                                         : (hit > 0) ? "ok"
-                                                    : "no file of this stage in the folder";
+                                        : (seen > 0 ? "no file of this stage in the folder" : "not seen");
                     if (close > 0) ++todo;
                     LogLine("SPIRV SUMMARY:   %-12s | %6ld | %6ld | %6ld | %s",
                         StageBucketName(b), seen, hit, close, verdict);
@@ -5548,6 +5557,7 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     // forward the calls instead of moving the code out of the namespace.
     void ForgetReplacementIndexImpl() { spvrw::ForgetReplacementIndexImpl(); }
     void NoteReplacementHit(bool exact, const char* how) { spvrw::NoteReplacementHit(exact, how); }
+    void NoteLookupStage(uint32_t stage) { spvrw::NoteLookupStage(stage); }
     void LogReplacementSummary() { spvrw::LogReplacementSummary(); }
     void RunReplacementSelfTest(int mode) { spvrw::RunReplacementSelfTest(mode); }
 
@@ -7262,6 +7272,7 @@ vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* pInfo,
     //      whose capability profile makes the game emit an equivalent module with
     //      different ids/enums. Without this, spv_replace is silently skipped on
     //      those GPUs and the replacement lighting never appears.
+    NoteLookupStage(si.model);   // lets the per-stage table count byte-hash hits too
     if (g_replMap && !g_replMap->empty()) {
         std::wstring chosenPath;
         bool havePath = false;
