@@ -84,9 +84,26 @@ Intel этот же файл тоже будет принят.
 
 ### Как понять результат
 
-- `SELFTEST PASSED` + `replacement index: 3 file(s)` → **готово**, папка универсальная.
+- `SELFTEST PASSED: 3/3 ... The folder is portable` → **файлы в порядке**, папка
+  переносимая. Именно это уже подтверждено на твоей машине.
 - `SELFTEST FAILED` → пришли лог, буду смотреть конкретный файл.
 - `SELFTEST: spv_replace is empty` → `spv_replace` не рядом с DLL (пункт 2 части 1).
+
+**Важно:** `SELFTEST PASSED` говорит только про **файлы**. Он не означает, что игра
+реально взяла замену. Про это говорит отдельная строка в самом конце лога, пишется при
+закрытии игры:
+
+| Строка | Что значит |
+|---|---|
+| `SPIRV SUMMARY: PORTABLE PATH USED - N replacement(s) accepted by structure...` | **это и есть proof**: замена принята по сходству, а не по точному хешу — ровно то, что делает чужая карта |
+| `SPIRV SUMMARY: N replacement(s) accepted by exact hash only` | работало только на твоей карте; на другой не сработало бы — пришли лог |
+| `SPIRV SUMMARY: NOTHING ACCEPTED - N lookup(s) found no replacement` | игра шейдеры подала, но ни один файл не подошёл — пришли лог + строки `no replacement for hash=` |
+| `SPIRV SUMMARY: no shader went through the replacement lookup` | игра не успела создать ни одного шейдера (лог снят до запуска) или `spv_replace` не найден |
+
+**Что уже проверено на твоём логе:** `SELFTEST PASSED: 3/3`, все три файла
+(`spv_74f939dce4aeb68a`, `spv_4e83efa89ef950d3`, `spv_801f80bf7bdfa946`) узнаются после
+пересборки «как на другой карте», и оба режима (с именами и без) дают `identical`.
+Файлы переносимые — это подтверждено.
 
 ---
 
