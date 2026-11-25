@@ -104,6 +104,7 @@ Intel этот же файл тоже будет принят.
 | `SPIRV SUMMARY: NOTHING ACCEPTED - N lookup(s) found no replacement` | игра шейдеры подала, но ни один файл не подошёл — пришли лог + строки `no replacement for hash=` |
 | `SPIRV SUMMARY: no shader went through the replacement lookup` | игра не успела создать ни одного шейдера (лог снят до запуска) или `spv_replace` не найден |
 | `SPIRV: replacement ACCEPTED (identical)` | живая строка: замена реально подставлена, вид совпадения — `identical`/`similar`/`loose` |
+| `rebuilt with another vendor's capability profile: 18/18` | (в `spv_check`) файлы узнаются даже после смены набора возможностей, как у NVIDIA/Intel |
 
 **Что уже проверено на твоём логе:** `SELFTEST PASSED: 3/3`, все три файла
 (`spv_74f939dce4aeb68a`, `spv_4e83efa89ef950d3`, `spv_801f80bf7bdfa946`) узнаются после
@@ -111,6 +112,30 @@ Intel этот же файл тоже будет принят.
 Файлы переносимые — это подтверждено.
 
 ---
+
+## Часть 2б. Если замена всё ещё не подхватилась — собрать «улику»
+
+Это нужно, только если в логе видно `NOTHING ACCEPTED` или `accepted by exact hash only`.
+
+1. В `VulkanProxy.ini` поставь `DumpLookupInput=8` (рядом с `DumpSamples`).
+2. Запусти игру на 1 минуту до игрового процесса, выйди.
+3. Рядом с логом появятся файлы `spv_input_<стадия>_<номер>.spv` — это **настоящие**
+   шейдеры, которые твоя карта отдала игре.
+4. Запусти:
+   ```
+   spv_check.exe "путь\к\spv_replace" "путь\к\spv_input_5_42.spv"
+   ```
+   (второй аргумент — имя любого из дампов)
+5. Внизу будет по строчке на каждый файл из `spv_replace`:
+   ```
+   spv_801f80bf7bdfa946.spv  stage=same shape=0.997 layout=0.667
+   => WOULD MATCH: spv_801f80bf7bdfa946.spv (identical)
+   ```
+   `shape` — совпадение структуры команд, `layout` — совпадение дескрипторов.
+   Нужно: `shape>=0.98 и layout>=1.00` (identical), либо `0.90/0.75` (similar),
+   либо `0.75/0.50` (loose). Если `stage=DIFF` — в папке нет шейдера этой стадии.
+6. Пришли мне эти 2–3 строчки — по ним видно точную причину без догадок.
+7. Не забудь вернуть `DumpLookupInput=0`.
 
 ## Часть 3. Частые вопросы
 
