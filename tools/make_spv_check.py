@@ -119,6 +119,111 @@ static size_t CountNames(const std::string& names) {
     return n;
 }
 
+// ---- "another vendor's frontend" simulation ---------------------------------
+// The standard rebuild above only changes ids, order and debug names. A different
+// GPU vendor additionally changes things the driver/frontend decides: the
+// OpCapability set, OpSource metadata, the generator word and the bound. Those
+// mutations are what a real 1080 Ti / Arc module differs by, so the matcher has to
+// survive them as well - otherwise the folder only ever works on the card it was
+// captured from.
+static void Vendorize(const uint32_t* w, size_t n, uint32_t seed, int profile,
+                      std::vector<uint32_t>& out) {
+    if (!w || n < 5) return;
+    struct Inst { uint32_t op, wc; size_t off; };
+    std::vector<Inst> insts;
+    for (size_t i = 5; i < n;) {
+        const uint32_t wc = w[i] >> 16, op = w[i] & 0xFFFFu;
+        if (wc == 0 || i + wc > n) break;
+        if (op == 5 || op == 6) { i += wc; continue; }          // debug names
+        insts.push_back({ op, wc, i });
+        i += wc;
+    }
+
+    std::vector<uint32_t> red;
+    red.insert(red.end(), w, w + 5);
+    // Header: a different vendor writes a different generator id, bound and version.
+    red[2] = 0x00080007u + seed;
+    red[1] = 0x00010500u;
+    for (const Inst& in : insts) {
+        if (profile >= 1) {
+            // Capability profile: drop every optional capability, then add Int64.
+            // That is exactly the difference between a GCN2 card and a Pascal one.
+            if (in.op == 17) {
+                const uint32_t cap = (in.wc >= 2) ? w[in.off + 1] : 0;
+                if (cap != 1) continue;                          // keep only Shader
+                for (uint32_t k = 0; k < in.wc; ++k) red.push_back(w[in.off + k]);
+                continue;
+            }
+            if (in.op == 3 || in.op == 2 || in.op == 4) continue; // OpSource/OpSourceExtension/OpSourceContinued
+        }
+        for (uint32_t k = 0; k < in.wc; ++k) red.push_back(w[in.off + k]);
+    }
+    if (profile >= 1) {
+        // The added capability arrives as a new instruction in the module head.
+        const uint32_t capInst = (2u << 16) | 17u;
+        red.insert(red.begin() + 5, { capInst, 11u });            // OpCapability Int64
+    }
+    if (profile >= 2) {
+        // A second profile on top: what else two frontends do differently for the same
+        // shader source - integer signedness, precision decorations and the execution
+        // mode spelling. None of this changes what the shader computes.
+        for (size_t i = 5; i < red.size();) {
+            const uint32_t wc = red[i] >> 16, op = red[i] & 0xFFFFu;
+            if (wc == 0 || i + wc > red.size()) break;
+            if (op == 21 && wc >= 4) red[i + 3] = red[i + 3] ^ 1u;       // OpTypeInt signedness
+            else if (op == 16 && wc >= 3) red[i + 2] = 17u;             // OpExecutionMode LocalSizeId
+            i += wc;
+        }
+        // OpDecorate RelaxedPrecision on the result of the first few float operations:
+        // a real frontend emits these, and they must not break the match.
+        std::vector<uint32_t> extra;
+        size_t added = 0;
+        for (size_t i = 5; i + 2 < red.size() && added < 24;) {
+            const uint32_t wc = red[i] >> 16, op = red[i] & 0xFFFFu;
+            if (wc == 0 || i + wc > red.size()) break;
+            if ((op == 129 || op == 130) && wc >= 3) {                 // OpIAdd / OpFAdd
+                extra.push_back((3u << 16) | 71u);                     // OpDecorate
+                extra.push_back(red[i + 2]);
+                extra.push_back(0u);                                   // RelaxedPrecision
+                ++added;
+            }
+            i += wc;
+        }
+        if (!extra.empty()) red.insert(red.begin() + 5, extra.begin(), extra.end());
+    }
+
+    // Final step: new ids and a new instruction order, like the standard rebuild.
+    RenumberAndShuffle(red.data(), red.size(), seed, false, out);
+}
+
+// ---- offline comparison of a real module against the folder -----------------
+// Prints the exact numbers the in-game lookup compares, so a log from a machine
+// where the replacement was not accepted can be explained without guessing.
+static void ExplainOne(const wchar_t* file, const std::vector<ReplacementEntry>& entries) {
+    std::vector<uint32_t> words;
+    if (!ReadSpvFile(file, words)) { printf("  %ls: unreadable\n", file); return; }
+    spvrw::ReplacementFingerprint fp;
+    if (!spvrw::ExtractFingerprint(words.data(), words.size(), fp)) { printf("  %ls: unparsable\n", file); return; }
+    const wchar_t* base = wcsrchr(file, L'\\');
+    printf("\n%ls (%s, %zu words, %zu names, %zu ifaces)\n", base ? base + 1 : file,
+        StageName(fp.stage), fp.words, CountNames(fp.names), fp.interfaceCount);
+    for (const ReplacementEntry& e : entries) {
+        const wchar_t* eb = wcsrchr(e.path.c_str(), L'\\');
+        const double shape = HistogramSimilarity(fp.shapeHistogram, e.fp.shapeHistogram);
+        const double lay = LayoutSimilarity(fp.layout, e.fp.layout);
+        printf("   vs %-30ls stage=%s shape=%.3f layout=%.3f\n",
+            eb ? eb + 1 : e.path.c_str(), (e.stage == fp.stage) ? "same" : "DIFF", shape, lay);
+    }
+    const char* level = nullptr;
+    const std::wstring* pick = BestSimilarityMatch(entries, fp, &level);
+    if (pick) {
+        const wchar_t* pb = wcsrchr(pick->c_str(), L'\\');
+        printf("   => WOULD MATCH: %ls (%s)\n", pb ? pb + 1 : pick->c_str(), level ? level : "?");
+    } else {
+        printf("   => NO MATCH (needs shape>=0.98/0.90/0.75 and layout>=1.00/0.75/0.50)\n");
+    }
+}
+
 int wmain(int argc, wchar_t** argv) {
     SetConsoleOutputCP(65001);
     wchar_t dir[MAX_PATH * 2]{};
@@ -132,6 +237,9 @@ int wmain(int argc, wchar_t** argv) {
     }
     printf("=== spv_replace portability check ===\n");
     printf("folder: %ls\n\n", dir);
+    // Optional second argument: a module captured from the game (DumpLookupInput=N).
+    // Then the tool explains, number by number, why it is or is not accepted.
+    const bool explainMode = argc > 2;
 
     std::vector<ReplacementEntry> entries;
     size_t files = 0, unreadable = 0;
@@ -181,7 +289,7 @@ int wmain(int argc, wchar_t** argv) {
 
     // The real test: rebuild every module the way another driver would and require
     // the matcher to find the original file again.
-    size_t pass = 0, fail = 0, namedPass = 0;
+    size_t pass = 0, fail = 0, namedPass = 0, vendorPass = 0, vendorFail = 0;
     printf("rebuilding each file the way another driver would\n");
     printf("(new ids, shuffled instruction order, stripped names, different size)\n\n");
     for (size_t k = 0; k < entries.size(); ++k) {
@@ -212,16 +320,50 @@ int wmain(int argc, wchar_t** argv) {
             name ? name + 1 : entries[k].path.c_str(),
             ok1 ? "FOUND" : "MISSED", la ? la : "-",
             ok2 ? "FOUND" : "MISSED", lb ? lb : "-");
+
+        // Same file, but with a different vendor's capability profile and metadata.
+        // Several independent variants: one lucky seed proves nothing when the folder
+        // holds several shaders of the same stage.
+        int vOk = 0, vTotal = 0;
+        for (int profile = 1; profile <= 2; ++profile) {
+            for (int v = 0; v < 3; ++v) {
+                std::vector<uint32_t> foreign;
+                Vendorize(words.data(), words.size(),
+                    static_cast<uint32_t>(0xBEEFu + k * 37u + v * 101u + profile * 7u), profile, foreign);
+                ReplacementFingerprint fc;
+                const char* lc = nullptr;
+                ++vTotal;
+                if (spvrw::ExtractFingerprint(foreign.data(), foreign.size(), fc)) {
+                    const std::wstring* p = BestSimilarityMatch(entries, fc, &lc);
+                    if (p && *p == entries[k].path) ++vOk;
+                }
+            }
+        }
+        vendorPass += vOk; vendorFail += (vTotal - vOk);
+        printf("  %-30ls other vendor profile:       %d/%d\n",
+            "", vOk, vTotal);
+    }
+
+    if (explainMode) {
+        printf("\n=== why is this module (not) accepted? ===\n");
+        ExplainOne(argv[2], entries);
+        printf("\n(Press Enter to close...)");
+        (void)getchar();
+        return 0;
     }
 
     printf("\n=== RESULT ===\n");
-    if (fail == 0) {
+    printf("rebuilt like another driver: %zu/%zu\n", pass, pass + fail);
+    printf("rebuilt with another vendor's capability profile: %zu/%zu\n", vendorPass, vendorPass + vendorFail);
+    if (fail == 0 && vendorFail == 0) {
         printf("PASS: %zu/%zu replacement(s) are recognised after being rebuilt the way\n", pass, pass + fail);
         printf("      another GPU's driver would rebuild them.\n");
         printf("      => this folder is portable and will be picked up on NVIDIA/Intel too.\n");
     } else {
-        printf("FAIL: %zu of %zu replacement(s) were NOT recognised (%zu/%zu with names).\n",
+        printf("FAIL: %zu of %zu replacement(s) were NOT recognised (%zu/%zu with names),\n",
             fail, pass + fail, namedPass, pass + fail);
+        printf("      and %zu of %zu were lost once the capability profile changed.\n",
+            vendorFail, vendorPass + vendorFail);
         printf("      Send this text (or a screenshot of this window).\n");
     }
     printf("\nPress Enter to close...");

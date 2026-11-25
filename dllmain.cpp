@@ -1999,6 +1999,7 @@ namespace {
         int selfTest = 0;               // 0 = off, 1 = check the first 8 replacement files, 2 = all
         int forceVirtualRtByDefault = 0; // 1 = treat every GPU as "no RT at all" (old, uniform behaviour)
         int dumpSamples = 0;       // dump N working compute shaders of two kinds (for comparison with crashing ones)
+        int dumpLookupInput = 0;   // dump the first N modules the game hands over, to compare offline with spv_replace
         int serializeCompile = 1; // one thread at a time inside driver shader/pipeline compilation
         int promoteFloat16 = 0;   // старый промоутер - ВЫКЛ (ломает layout буферов)
         int lowerFp16 = 0;        // ВЫКЛ: заменяем на комбинированный проход
@@ -2142,6 +2143,7 @@ namespace {
         }
         g_spvCfg.useReplacements = rd(L"UseReplacements", 1);
         g_spvCfg.dumpSamples = rd(L"DumpSamples", 0);
+        g_spvCfg.dumpLookupInput = rd(L"DumpLookupInput", 0);
         g_spvCfg.rewriteRayQuery = rd(L"RewriteRayQuery", 1);
         g_spvCfg.dumpRewrite = rd(L"DumpRewrite", 0);
         g_spvCfg.dumpRewriteFail = rd(L"DumpRewriteFail", 3);
@@ -4886,7 +4888,12 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
             // remove it on one machine and not on another.
             const bool rtOp = spvrw::IsRayTracingOpForSignature(op);
             const bool rtCap = (op == 17 && wc >= 2 && spvrw::IsRayTracingCapability(w[i + 1]));
-            if (!rtOp && !rtCap) {
+            // Decorations are frontend metadata, not structure: some drivers emit
+            // RelaxedPrecision/NoContraction for every single float operation, others
+            // none at all. Counting them made two builds of the SAME shader score only
+            // ~0.82 and fail a match that had nothing to do with the shader.
+            const bool metaOp = (op == 71 || op == 72 || op == 73 || op == 74);
+            if (!rtOp && !rtCap && !metaOp) {
                 std::vector<char> roles(wc, 'L');
                 spvrw::ForEachId(w + i, op, wc, [&](size_t idx, char) { if (idx < roles.size()) roles[idx] = 'I'; });
                 uint64_t h = 0xcbf29ce484222325ull;
@@ -4989,12 +4996,18 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     // would leave the original module in place, which is the black-screen failure
     // this code exists to remove.
     constexpr double kFuzzyMargin = 0.05;
-    constexpr double kFuzzyMarginNoNames = 0.002;
+    // The margin is in score units (shape + layout + names, max 3.0). Different drivers
+    // put the same shader within ~0.02 of each other and different shaders far apart, so
+    // a very small margin is enough once the absolute floors below are respected.
+    constexpr double kFuzzyMarginNoNames = 0.0005;
     // Without names the score is a pure instruction-shape comparison, which two
     // unrelated shaders that merely share a similar mix can also reach. A very high
     // absolute floor is therefore required as well, so a name-less module is only
     // ever mapped onto a nearly identical module.
-    constexpr double kFuzzyShapeFloorNoNames = 0.99;
+    // A vendor's frontend can add or drop one or two instructions for the same shader
+    // (a precision decoration, an execution mode), so requiring 0.99 here rejected
+    // modules that differ by exactly that and nothing else.
+    constexpr double kFuzzyShapeFloorNoNames = 0.97;
 
     ReplacementIndex* g_replIndex = nullptr;
     ReplacementIndex* EnsureReplacementIndex();
@@ -7304,6 +7317,14 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
     static volatile LONG deniedSeen = 0;
     const LONG dn = si.deny ? InterlockedIncrement(&deniedSeen) : 0;
     const bool logIt = g_spvCfg.logAll || (si.deny && dn <= 30) || n <= 10;
+    if (g_spvCfg.dumpLookupInput > 0) {
+        static volatile LONG dumpedInputs = 0;
+        if (InterlockedIncrement(&dumpedInputs) <= g_spvCfg.dumpLookupInput) {
+            char tag[48];
+            _snprintf_s(tag, sizeof(tag), _TRUNCATE, "input_%u_%ld", si.model, n);
+            DumpSpirv(tag, n, originalCode, originalBytes);
+        }
+    }
     if (n % 200 == 0) LogLine("SHADER stats: total=%ld denied=%ld", n, (long)deniedSeen);
     // A summary every 50 modules: the definitive one is logged at process detach, but a
     // game that is force-closed (or crashes) never gets there, and then the log has no
