@@ -1223,6 +1223,20 @@ static const SpvOpDesc kSpvOps[] = {
         return !fp.norm.empty();
     }
 
+    inline const char* SpvStageName(uint32_t model) {
+        switch (model) {
+        case 0: return "vertex";
+        case 1: return "tess-control";
+        case 2: return "tess-eval";
+        case 3: return "geometry";
+        case 4: return "fragment";
+        case 5: return "compute";
+        case 5267: return "task";
+        case 5268: return "mesh";
+        default: return "other";
+        }
+    }
+
     // Portable keys: the descriptor interface (which the pipeline layout requires
     // anyway) plus the debug names. Instruction order is never part of a key.
     struct ReplacementKeySet {

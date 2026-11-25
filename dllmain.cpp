@@ -4928,6 +4928,20 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         return !fp.norm.empty();
     }
 
+    inline const char* SpvStageName(uint32_t model) {
+        switch (model) {
+        case 0: return "vertex";
+        case 1: return "tess-control";
+        case 2: return "tess-eval";
+        case 3: return "geometry";
+        case 4: return "fragment";
+        case 5: return "compute";
+        case 5267: return "task";
+        case 5268: return "mesh";
+        default: return "other";
+        }
+    }
+
     // Portable keys: the descriptor interface (which the pipeline layout requires
     // anyway) plus the debug names. Instruction order is never part of a key.
     struct ReplacementKeySet {
@@ -5322,7 +5336,33 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
             if (pick) found = *pick;
         }
         ReleaseSRWLockShared(&g_replIndexLock);
-        if (!level) { InterlockedIncrement(&g_replMisses); return false; }
+        if (!level) {
+            // Why did nothing match? Print the closest candidate and the three
+            // numbers that decide it, so a log from another machine is enough to
+            // tell what to relax without access to that machine.
+            double bestShape = -1.0, bestLayout = -1.0;
+            const wchar_t* bestName = L"(none)";
+            for (const ReplacementEntry& e : idx->entries) {
+                if (e.stage != fp.stage) continue;
+                const double shape = HistogramSimilarity(fp.shapeHistogram, e.fp.shapeHistogram);
+                if (shape <= bestShape) continue;
+                bestShape = shape;
+                bestLayout = LayoutSimilarity(fp.layout, e.fp.layout);
+                const wchar_t* base = wcsrchr(e.path.c_str(), L'\\');
+                bestName = base ? base + 1 : e.path.c_str();
+            }
+            static volatile LONG missLogs = 0;
+            if (InterlockedIncrement(&missLogs) <= 12) {
+                if (bestShape < 0.0)
+                    LogLine("SPIRV: no replacement for hash=%016llX - stage %u (%s) not present in spv_replace at all",
+                        static_cast<unsigned long long>(hash), fp.stage, SpvStageName(fp.stage));
+                else
+                    LogLine("SPIRV: no replacement for hash=%016llX - closest %ls: shape=%.3f layout=%.2f (need shape>=0.75, layout>=0.50 at the loosest level)",
+                        static_cast<unsigned long long>(hash), bestName, bestShape, bestLayout);
+            }
+            InterlockedIncrement(&g_replMisses);
+            return false;
+        }
 
         outPath = found;
         if (how) *how = level;
