@@ -1309,6 +1309,24 @@ static const SpvOpDesc kSpvOps[] = {
     // holds a handful of files, the game compiles hundreds), or a plausible candidate
     // was rejected by the thresholds (actionable).
     volatile LONG g_replMissNoCandidate = 0, g_replMissRejected = 0;
+    // Which stages the game asked for but the folder cannot serve. Reported once in the
+    // summary: it explains hundreds of "no counterpart" misses with one number, because
+    // a folder holding only compute modules can never replace a fragment shader.
+    volatile LONG g_replMissStageMask = 0;
+    volatile LONG g_replMissStageLogged = 0;   // 0 = not yet reported in the summary
+    volatile LONG g_replSeenStageMask = 0;
+
+    inline const char* StageBitName(int bit) {
+        switch (bit) {
+        case 0: return "vertex";
+        case 1: return "tess-control";
+        case 2: return "tess-eval";
+        case 3: return "geometry";
+        case 4: return "fragment";
+        case 5: return "compute";
+        default: return "other";
+        }
+    }
 
     void AddToIndex(std::unordered_map<std::string, std::wstring>& m,
                     std::unordered_set<std::string>& ambiguous,

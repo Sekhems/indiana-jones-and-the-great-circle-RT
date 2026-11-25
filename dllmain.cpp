@@ -5018,6 +5018,24 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     // holds a handful of files, the game compiles hundreds), or a plausible candidate
     // was rejected by the thresholds (actionable).
     volatile LONG g_replMissNoCandidate = 0, g_replMissRejected = 0;
+    // Which stages the game asked for but the folder cannot serve. Reported once in the
+    // summary: it explains hundreds of "no counterpart" misses with one number, because
+    // a folder holding only compute modules can never replace a fragment shader.
+    volatile LONG g_replMissStageMask = 0;
+    volatile LONG g_replMissStageLogged = 0;   // 0 = not yet reported in the summary
+    volatile LONG g_replSeenStageMask = 0;
+
+    inline const char* StageBitName(int bit) {
+        switch (bit) {
+        case 0: return "vertex";
+        case 1: return "tess-control";
+        case 2: return "tess-eval";
+        case 3: return "geometry";
+        case 4: return "fragment";
+        case 5: return "compute";
+        default: return "other";
+        }
+    }
 
     void AddToIndex(std::unordered_map<std::string, std::wstring>& m,
                     std::unordered_set<std::string>& ambiguous,
@@ -5344,6 +5362,7 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
 
         spvrw::ReplacementFingerprint fp;
         if (!spvrw::ExtractFingerprint(code, nWords, fp)) return false;
+        InterlockedOr(&g_replSeenStageMask, 1L << ((fp.stage < 6) ? static_cast<int>(fp.stage) : 5));
         const ReplacementKeySet keys = MakeKeySet(fp);
         if (!keys.valid) return false;
 
@@ -5392,8 +5411,11 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
             // loosest tier requires. Everything else is a shader the folder does not have.
             if (bestShape >= 0.0 && bestShape >= 0.75 && bestLayout >= 0.50)
                 InterlockedIncrement(&g_replMissRejected);
-            else
+            else {
                 InterlockedIncrement(&g_replMissNoCandidate);
+                const int bit = (fp.stage < 6) ? static_cast<int>(fp.stage) : 5;   // bucket the exotic stages
+                InterlockedOr(&g_replMissStageMask, 1L << bit);
+            }
             InterlockedIncrement(&g_replMisses);
             return false;
         }
@@ -5439,6 +5461,20 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     void LogReplacementSummary() {
         const long hitExact = g_replHitsExact, hitSim = g_replHitsSimilar, miss = g_replMisses;
         const long noCand = g_replMissNoCandidate, rejected = g_replMissRejected;
+        {
+            // One line that names the stages: "folder has no compute module" is the whole
+            // explanation for most misses and needs no log analysis.
+            const long seen = g_replSeenStageMask, absent = g_replMissStageMask;
+            if (seen && InterlockedCompareExchange(&g_replMissStageLogged, 1, 0) == 0) {
+                char have[128] = {}, lack[128] = {};
+                for (int b = 0; b < 6; ++b) {
+                    if (seen & (1L << b)) { strncat_s(have, sizeof(have), StageBitName(b), _TRUNCATE); strncat_s(have, sizeof(have), " ", _TRUNCATE); }
+                    if (absent & (1L << b)) { strncat_s(lack, sizeof(lack), StageBitName(b), _TRUNCATE); strncat_s(lack, sizeof(lack), " ", _TRUNCATE); }
+                }
+                LogLine("SPIRV: stages the game compiled: [%s] | stages with NO module in spv_replace: [%s]",
+                    have, lack[0] ? lack : "none");
+            }
+        }
         if (hitExact + hitSim + miss == 0)
             LogLine("SPIRV SUMMARY: no shader went through the replacement lookup (self-test only, or the game never created a module)");
         else if (rejected == 0 && hitSim == 0)
