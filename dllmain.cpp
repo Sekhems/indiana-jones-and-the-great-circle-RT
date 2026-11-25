@@ -2031,6 +2031,8 @@ namespace {
     // vkCreateInstance use these two entry points.
     void ForgetReplacementIndexImpl();
     void RunReplacementSelfTest(int mode);
+    // The hit counters live in spvrw; the shader path below has to bump them too.
+    void NoteReplacementHit(bool exact, const char* how);
     void ScanReplacements(const wchar_t* iniPath) {
         wchar_t dir[2048]{};
         wcsncpy_s(dir, iniPath, _TRUNCATE);
@@ -5383,12 +5385,22 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         ReleaseSRWLockExclusive(&g_replIndexLock);
         delete stale;
     }
+
+    // Counts a replacement the byte hash or the structural lookup accepted. `how` is the
+    // tier reported by FindReplacement ("names"/"plan"/"identical"/"similar"/"loose"), and
+    // it is logged so the exact tier is visible in the diagnostic log.
+    void NoteReplacementHit(bool exact, const char* how) {
+        if (exact) { InterlockedIncrement(&g_replHitsExact); return; }
+        InterlockedIncrement(&g_replHitsSimilar);
+        (void)how;
+    }
 }   // namespace spvrw
 
     // The anonymous namespace declares these two as its entry points (see the config
     // loader and vkCreateInstance); the index and the self-test live in spvrw, so
     // forward the calls instead of moving the code out of the namespace.
     void ForgetReplacementIndexImpl() { spvrw::ForgetReplacementIndexImpl(); }
+    void NoteReplacementHit(bool exact, const char* how) { spvrw::NoteReplacementHit(exact, how); }
     void RunReplacementSelfTest(int mode) { spvrw::RunReplacementSelfTest(mode); }
 
     // ---- SPIR-V module info ---------------------------------------------------
@@ -7111,10 +7123,10 @@ vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* pInfo,
         if (it != g_replMap->end()) {
             chosenPath = it->second;
             havePath = true;
-            InterlockedIncrement(&g_replHitsExact);
+            NoteReplacementHit(true, matchKind);
         } else if (spvrw::FindReplacement(originalCode, nWords, originalHash, chosenPath, &matchKind)) {
             havePath = true;
-            InterlockedIncrement(&g_replHitsSimilar);
+            NoteReplacementHit(false, matchKind);
             static volatile LONG matchLogs = 0;
             if (InterlockedIncrement(&matchLogs) <= 24)
                 LogLine("SPIRV: shader replacement matched (%s) hash=%016llX - this GPU builds the module differently, substituting the equivalent spv_replace module",
