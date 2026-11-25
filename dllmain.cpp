@@ -4965,8 +4965,20 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         bool ready = false;
     };
 
-    // kFuzzyMargin keeps two equally plausible candidates from being swapped.
+    // kFuzzyMargin keeps two equally plausible candidates from being swapped. When
+    // names are available the margin is generous (the ranking is trustworthy). When
+    // one side has no debug names the name gate is skipped, the scores of similar
+    // shaders sit very close to each other, and a strict margin would reject the
+    // correct file; there a relative margin is used instead. Rejecting everything
+    // would leave the original module in place, which is the black-screen failure
+    // this code exists to remove.
     constexpr double kFuzzyMargin = 0.05;
+    constexpr double kFuzzyMarginNoNames = 0.002;
+    // Without names the score is a pure instruction-shape comparison, which two
+    // unrelated shaders that merely share a similar mix can also reach. A very high
+    // absolute floor is therefore required as well, so a name-less module is only
+    // ever mapped onto a nearly identical module.
+    constexpr double kFuzzyShapeFloorNoNames = 0.99;
 
     ReplacementIndex* g_replIndex = nullptr;
     SRWLOCK g_replIndexLock = SRWLOCK_INIT;
@@ -5007,7 +5019,7 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
             { 0.750, 0.50, 0.34, "loose" },
         };
         for (const Tier& tier : tiers) {
-            double best = -1.0, second = -1.0;
+            double best = -1.0, second = -1.0, bestShape = 0.0;
             const std::wstring* bestPath = nullptr;
             for (const ReplacementEntry& e : entries) {
                 if (e.stage != fp.stage) continue;
@@ -5029,10 +5041,16 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
                 }
 
                 const double score = shape + lay + namesScore;
-                if (score > best) { second = best; best = score; bestPath = &e.path; }
+                if (score > best) { second = best; best = score; bestShape = shape; bestPath = &e.path; }
                 else if (score > second) { second = score; }
             }
-            if (bestPath && (second < 0.0 || best - second >= kFuzzyMargin)) {
+            // The margin depends on whether the names of the winner were compared:
+            // when the incoming module has none (stripped build) every score is a pure
+            // shape comparison and similar shaders land within a few thousandths.
+            const bool nameless = fp.names.empty();
+            const double margin = nameless ? kFuzzyMarginNoNames : kFuzzyMargin;
+            const bool shapeHighEnough = !nameless || bestShape >= kFuzzyShapeFloorNoNames;
+            if (bestPath && shapeHighEnough && (second < 0.0 || best - second >= margin)) {
                 if (matchedLevel) *matchedLevel = tier.name;
                 return bestPath;
             }
