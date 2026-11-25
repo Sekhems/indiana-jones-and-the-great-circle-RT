@@ -10,18 +10,39 @@
 #>
 param(
     [string]$Exe = '',
-    [int]$MaxLines = 0
+    [int]$MaxLines = 0,
+    [string]$Log = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-$log  = Join-Path $root 'VulkanProxy_diagnostic.log'
+$log  = if ($Log) { $Log } else { Join-Path $root 'VulkanProxy_diagnostic.log' }
+if (-not (Test-Path $log)) {
+    # The log is written next to vulkan-1.dll, which is not always this folder.
+    $probe = @(Get-ChildItem -LiteralPath (Split-Path -Parent $root) -Filter 'VulkanProxy_diagnostic.log' -Recurse -ErrorAction SilentlyContinue |
+               Sort-Object LastWriteTime -Descending | Select-Object -First 2)
+    if ($probe.Count -ge 2 -and $probe[0].LastWriteTime -ne $probe[1].LastWriteTime) {
+        $log = $probe[0].FullName
+        Write-Host ("NOTE: no log here; using the newest one found under {0}:" -f (Split-Path -Parent $root)) -ForegroundColor Yellow
+        Write-Host ("      {0}  ({1:yyyy-MM-dd HH:mm})" -f $log, $probe[0].LastWriteTime) -ForegroundColor Yellow
+    }
+}
 $ini  = Join-Path $root 'VulkanProxy.ini'
 $repl = Join-Path $root 'spv_replace'
 
 function Section($t) { Write-Host ''; Write-Host "=== $t ===" -ForegroundColor Cyan }
 
 Section 'Files'
+if (Test-Path $log) {
+    $age = (Get-Date) - (Get-Item $log).LastWriteTime
+    $hdr = Select-String -LiteralPath $log -Pattern '=== VulkanProxy' | Select-Object -First 1
+    Write-Host ("log: {0}" -f $log)
+    Write-Host ("     last written {0:yyyy-MM-dd HH:mm} ({1:N1} h ago)" -f (Get-Item $log).LastWriteTime, $age.TotalHours)
+    if ($hdr) { Write-Host ('     ' + $hdr.Line.Trim()) }
+    if ($age.TotalHours -gt 24) {
+        Write-Host '     WARNING: this log is older than a day. If you rebuilt the DLL since, this is NOT your current build.' -ForegroundColor Red
+    }
+}
 foreach ($p in @($log, $ini, $repl)) {
     if (Test-Path $p) { Write-Host ("FOUND    {0}" -f $p) -ForegroundColor Green }
     else              { Write-Host ("MISSING  {0}" -f $p) -ForegroundColor Yellow }
@@ -69,6 +90,10 @@ $struct   = @(Select-String -LiteralPath $log -Pattern 'shader replacement match
 $rejected = @(Select-String -LiteralPath $log -Pattern 'shader replacement REJECTED')
 $misses   = @(Select-String -LiteralPath $log -Pattern 'no replacement for hash=')
 $noMatchAll = ($accepted.Count -eq 0 -and $misses.Count -gt 0)
+# A stale log (old DLL, old run) makes every conclusion below wrong. Say so loudly and
+# stop treating its numbers as a verdict on the current build.
+$logAge = if (Test-Path $log) { (Get-Date) - (Get-Item $log).LastWriteTime } else { [TimeSpan]::MaxValue }
+$logStale = ($logAge.TotalHours -gt 24)
 Write-Host ("  accepted  : {0}" -f $accepted.Count)
 Write-Host ("  by similarity: {0}" -f $struct.Count)
 Write-Host ("  rejected  : {0}" -f $rejected.Count) -ForegroundColor ($(if ($rejected.Count) {'Yellow'} else {'Gray'}))
@@ -76,7 +101,10 @@ Write-Host ("  no match  : {0}" -f $misses.Count)
 foreach ($m in ($accepted | Select-Object -First 8)) { Write-Host ('    ' + $m.Line.Trim()) -ForegroundColor Green }
 foreach ($m in ($struct   | Select-Object -First 8)) { Write-Host ('    ' + $m.Line.Trim()) -ForegroundColor Green }
 foreach ($m in ($rejected | Select-Object -First 8)) { Write-Host ('    ' + $m.Line.Trim()) -ForegroundColor Yellow }
-if ($noMatchAll) {
+if ($noMatchAll -and $logStale) {
+    Write-Host '  All lookups in THIS LOG missed, but the log is over a day old (see the Files section).' -ForegroundColor Yellow
+    Write-Host '  Rebuild the DLL, run the game once, then run this script again - the numbers above are not from the current build.' -ForegroundColor Yellow
+} elseif ($noMatchAll) {
     Write-Host '  All lookups missed: no file in spv_replace is similar to the shaders this GPU compiles.' -ForegroundColor Red
     Write-Host '    - check that spv_replace sits next to the DLL and holds spv_<16 hex>.spv files' -ForegroundColor Yellow
     Write-Host '    - check the "replacement index" line above: candidates=0 means none of the files could be read' -ForegroundColor Yellow
