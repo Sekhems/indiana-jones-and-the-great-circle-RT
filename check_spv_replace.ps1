@@ -104,6 +104,21 @@ if ($portable.Count -or $liveHits.Count) {
     Write-Host '  => RESULT: shaders were processed but no replacement was accepted. Send the log with the no-match lines.' -ForegroundColor Red
 }
 
+Section 'Per-stage result (what the folder served, what is left)'
+$table = @(Select-String -LiteralPath $log -Pattern 'SPIRV SUMMARY:   ')
+if ($table.Count) {
+    foreach ($m in ($table | Select-Object -Last 10)) { Write-Host ('  ' + ($m.Line -replace '^\[\d+\] SPIRV SUMMARY:\s+','')) }
+    $action = @($table | Where-Object { $_.Line -match 'ACTION' })
+    if ($action.Count) {
+        Write-Host '  => There ARE modules that almost matched and were rejected by the thresholds.' -ForegroundColor Yellow
+        Write-Host '     Set DumpLookupInput=8 in VulkanProxy.ini, run the game once, and send spv_input_*.spv.' -ForegroundColor Yellow
+    } else {
+        Write-Host '  => Nothing was rejected: the folder simply has no module for the missing stages.' -ForegroundColor Green
+    }
+} else {
+    Write-Host '  no per-stage table yet: it is printed after 200 lookups and needs the newest DLL.' -ForegroundColor DarkGray
+}
+
 Section 'Universal matching self-test (SelfTest=1 in the ini)'
 $selfLines = @(Select-String -LiteralPath $log -Pattern 'SELFTEST')
 if ($selfLines.Count -eq 0) {
