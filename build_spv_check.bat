@@ -23,7 +23,7 @@ if errorlevel 1 (
 )
 
 :build
-cl /nologo /std:c++17 /EHsc /O2 /MT spv_check.cpp /link /SUBSYSTEM:CONSOLE /OUT:spv_check.exe
+cl /nologo /std:c++17 /utf-8 /EHsc /O2 /MT spv_check.cpp /link /SUBSYSTEM:CONSOLE /OUT:spv_check.exe
 if errorlevel 1 (
     echo.
     echo ERROR: compilation failed. Send this window text.

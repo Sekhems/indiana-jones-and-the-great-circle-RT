@@ -1,4 +1,4 @@
-﻿// Vulkan proxy v3 for Windows x64 (vulkan-1.dll replacement that forwards to the
+// Vulkan proxy v3 for Windows x64 (vulkan-1.dll replacement that forwards to the
 // real system loader).
 //
 // Adds to v2:
@@ -41,6 +41,7 @@
 #include <utility>
 #include <unordered_set>
 #include <vector>
+#include <algorithm>
 
 #include "vk_proxy_exports.generated.h"
 
@@ -2026,9 +2027,9 @@ namespace {
         return h;
     }
     std::unordered_map<uint64_t, std::wstring>* g_replMap = nullptr;
-    // The replacement index is declared later (see FindReplacement); the config
-    // loader invalidates it there.
-    void ForgetReplacementIndex();
+    // The replacement index lives in spvrw (further below); the config loader and
+    // vkCreateInstance use these two entry points.
+    void ForgetReplacementIndexImpl();
     void RunReplacementSelfTest(int mode);
     void ScanReplacements(const wchar_t* iniPath) {
         wchar_t dir[2048]{};
@@ -2189,7 +2190,7 @@ namespace {
             // index so it is rebuilt from the folder that is on disk now. The lazy
             // builder publishes "ready" while holding the lock, so a concurrent
             // lookup can never observe a half-built index.
-            ForgetReplacementIndex();
+            ForgetReplacementIndexImpl();
         }
         LogLine("SPIRV: FollowHardwareCaps=%d StructureMatchFallback=%d FuzzyMatch=%d UniformShaderProfile=%d ForceVirtualRt=%d",
             g_spvCfg.followHardwareCaps, g_spvCfg.structureMatchFallback, g_spvCfg.fuzzyMatch,
@@ -4746,7 +4747,6 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
 
         return sig;
     }
-}
 
     // -----------------------------------------------------------------------
     // Universal replacement lookup.
@@ -4995,6 +4995,7 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     constexpr double kFuzzyShapeFloorNoNames = 0.99;
 
     ReplacementIndex* g_replIndex = nullptr;
+    ReplacementIndex* EnsureReplacementIndex();
     SRWLOCK g_replIndexLock = SRWLOCK_INIT;
     volatile LONG g_replIndexState = 0;
     volatile LONG g_replHitsExact = 0, g_replHitsSimilar = 0, g_replMisses = 0;
@@ -5292,6 +5293,7 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         return g_replIndex;
     }
 
+
     // Finds the replacement for one incoming module. Returns false when nothing
     // plausible is in spv_replace for it (the original module is then kept).
     bool FindReplacement(const uint32_t* code, size_t nWords, uint64_t hash,
@@ -5372,7 +5374,7 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         return true;
     }
 
-    void ForgetReplacementIndex() {
+    void ForgetReplacementIndexImpl() {
         InterlockedExchange(&g_replIndexState, 0);
         ReplacementIndex* stale = nullptr;
         AcquireSRWLockExclusive(&g_replIndexLock);
@@ -5381,6 +5383,13 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         ReleaseSRWLockExclusive(&g_replIndexLock);
         delete stale;
     }
+}   // namespace spvrw
+
+    // The anonymous namespace declares these two as its entry points (see the config
+    // loader and vkCreateInstance); the index and the self-test live in spvrw, so
+    // forward the calls instead of moving the code out of the namespace.
+    void ForgetReplacementIndexImpl() { spvrw::ForgetReplacementIndexImpl(); }
+    void RunReplacementSelfTest(int mode) { spvrw::RunReplacementSelfTest(mode); }
 
     // ---- SPIR-V module info ---------------------------------------------------
     struct SpvInfo {
@@ -7103,7 +7112,7 @@ vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* pInfo,
             chosenPath = it->second;
             havePath = true;
             InterlockedIncrement(&g_replHitsExact);
-        } else if (FindReplacement(originalCode, nWords, originalHash, chosenPath, &matchKind)) {
+        } else if (spvrw::FindReplacement(originalCode, nWords, originalHash, chosenPath, &matchKind)) {
             havePath = true;
             InterlockedIncrement(&g_replHitsSimilar);
             static volatile LONG matchLogs = 0;
@@ -8746,7 +8755,7 @@ vkCmdDraw(VkCommandBuffer cb, uint32_t vertexCount, uint32_t instanceCount, uint
         static volatile LONG skipped = 0;
         LONG n = InterlockedIncrement(&skipped);
         if (n <= 5 || n % 500 == 0)
-            LogLine("SKIP draw on FAKE pipeline (total skipped draws≈%ld)", (long)n);
+            LogLine("SKIP draw on FAKE pipeline (total skipped draws ~%ld)", (long)n);
         return;
     }
     auto real = RealExport<PFN_vkCmdDraw>("vkCmdDraw");

@@ -268,7 +268,7 @@ def main():
     inline_helpers = block(text, '    inline bool IsRayTracingCapability(uint32_t cap) {',
                            '    inline std::string StructuralSignature(')
     structural = block(text, '    inline std::string StructuralSignature(',
-                       '\n}\n\n    // -----------------------------------------------------------------------\n    // Universal replacement lookup.') + '\n}\n'
+                       '\n    }\n\n    // -----------------------------------------------------------------------\n    // Universal replacement lookup.') + '\n    }\n'
     analysis = inline_helpers + structural
     analysis = strip_trailing_namespace(analysis)
     lookup = block(text, '    // Universal replacement lookup.',

@@ -279,7 +279,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Resource Compiler (rc.exe) failed with exit code $LASTEXITCODE" }
 
     # 3. Компиляция и линковка DLL (включая .obj и .res файлы)
-    & $cl.Source /nologo /std:c++17 /EHsc /O2 /MT /LD /Zi "/I$includeDir" `
+    & $cl.Source /nologo /std:c++17 /utf-8 /EHsc /O2 /MT /LD /Zi "/I$includeDir" `
         dllmain.cpp $asmObj $resObj /link /DEBUG "/DEF:$defPath" /MACHINE:X64 "/OUT:$outDll"
     if ($LASTEXITCODE -ne 0) { throw "MSVC linker/compiler failed with exit code $LASTEXITCODE" }
 

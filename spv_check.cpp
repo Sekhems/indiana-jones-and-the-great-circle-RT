@@ -1290,6 +1290,7 @@ static const SpvOpDesc kSpvOps[] = {
     constexpr double kFuzzyShapeFloorNoNames = 0.99;
 
     ReplacementIndex* g_replIndex = nullptr;
+    ReplacementIndex* EnsureReplacementIndex();
     SRWLOCK g_replIndexLock = SRWLOCK_INIT;
     volatile LONG g_replIndexState = 0;
     volatile LONG g_replHitsExact = 0, g_replHitsSimilar = 0, g_replMisses = 0;
