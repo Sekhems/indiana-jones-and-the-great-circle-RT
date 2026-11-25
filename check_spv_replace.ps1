@@ -35,7 +35,7 @@ Write-Host ("spv_replace files: {0}" -f $replCount)
 if (Test-Path $ini) {
     Section 'Effective switches (VulkanProxy.ini)'
     $keys = 'Mode','ForceVirtualRt','DenyFloat16','DenyInt16','DenyDotProduct','DenyMesh',
-            'FollowHardwareCaps','StructureMatchFallback','FuzzyMatch','UseReplacements','RewriteRayQuery','TryVariants'
+            'FollowHardwareCaps','StructureMatchFallback','FuzzyMatch','SelfTest','UseReplacements','RewriteRayQuery','TryVariants'
     $text = Get-Content -LiteralPath $ini
     foreach ($k in $keys) {
         $line = $text | Where-Object { $_ -match "^\s*$([regex]::Escape($k))\s*=" } | Select-Object -First 1
@@ -81,6 +81,18 @@ if ($noMatchAll) {
     Write-Host '    - check that spv_replace sits next to the DLL and holds spv_<16 hex>.spv files' -ForegroundColor Yellow
     Write-Host '    - check the "replacement index" line above: candidates=0 means none of the files could be read' -ForegroundColor Yellow
     Write-Host '    - FuzzyMatch=0 in VulkanProxy.ini disables similarity matching; this build needs it at 1' -ForegroundColor Yellow
+}
+
+Section 'Universal matching self-test (SelfTest=1 in the ini)'
+$selfLines = @(Select-String -LiteralPath $log -Pattern 'SELFTEST')
+if ($selfLines.Count -eq 0) {
+    Write-Host '  not run (SelfTest=0). Set SelfTest=1 to verify on THIS card that the folder is portable.' -ForegroundColor DarkGray
+} else {
+    foreach ($m in ($selfLines | Select-Object -First 30)) { Write-Host ('  ' + $m.Line.Trim()) }
+    $passed = @($selfLines | Where-Object { $_.Line -match 'SELFTEST PASSED' })
+    $failed = @($selfLines | Where-Object { $_.Line -match 'SELFTEST FAILED' })
+    if ($passed.Count) { Write-Host '  Result: PASSED - replacements are found even when the module is rebuilt like another driver would.' -ForegroundColor Green }
+    elseif ($failed.Count) { Write-Host '  Result: FAILED - attach this log, the folder is not portable with the current build.' -ForegroundColor Red }
 }
 
 Section 'Shaders the proxy replaced with a stub (fake) module'

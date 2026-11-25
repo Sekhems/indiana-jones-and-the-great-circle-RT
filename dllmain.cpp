@@ -1995,6 +1995,7 @@ namespace {
         int followHardwareCaps = 1; // honour the real driver feature bits instead of the fixed deny list
         int structureMatchFallback = 1; // second-chance matching when the byte hash differs
         int fuzzyMatch = 1;             // similarity matching when the exact keys miss
+        int selfTest = 0;               // 0 = off, 1 = check the first 8 replacement files, 2 = all
         int forceVirtualRtByDefault = 0; // 1 = treat every GPU as "no RT at all" (old, uniform behaviour)
         int dumpSamples = 0;       // dump N working compute shaders of two kinds (for comparison with crashing ones)
         int serializeCompile = 1; // one thread at a time inside driver shader/pipeline compilation
@@ -2028,6 +2029,7 @@ namespace {
     // The replacement index is declared later (see FindReplacement); the config
     // loader invalidates it there.
     void ForgetReplacementIndex();
+    void RunReplacementSelfTest(int mode);
     void ScanReplacements(const wchar_t* iniPath) {
         wchar_t dir[2048]{};
         wcsncpy_s(dir, iniPath, _TRUNCATE);
@@ -2125,6 +2127,7 @@ namespace {
         g_spvCfg.followHardwareCaps = rd(L"FollowHardwareCaps", 1);
         g_spvCfg.structureMatchFallback = rd(L"StructureMatchFallback", 1);
         g_spvCfg.fuzzyMatch = rd(L"FuzzyMatch", 1);
+        g_spvCfg.selfTest = rd(L"SelfTest", 0);
         InterlockedExchange(&g_uniformShaderProfile, rd(L"UniformShaderProfile", 0));
         g_spvCfg.forceVirtualRtByDefault = rd(L"ForceVirtualRt", 0);
         g_spvCfg.tryVariants = rd(L"TryVariants", 1);
@@ -5080,6 +5083,175 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
             idx->entries.size(), maxWords, maxIfaces);
     }
 
+    // -----------------------------------------------------------------------
+    // Self-test of the universal matching, runnable on any GPU.
+    //
+    // The point is that a single machine can verify that the folder would be
+    // accepted elsewhere too: every module in spv_replace is turned into a
+    // "rebuilt by another driver" copy (renumbered ids, shuffled instruction
+    // order inside blocks, debug names dropped, a chunk of the body replaced by
+    // other instructions) and the matcher must still find the original file for
+    // it. That is exactly what failed on the NVIDIA card in the field.
+    //
+    // Enabled with SelfTest=1 in VulkanProxy.ini (2 = every file). Runs once, at
+    // startup, before the game compiles anything.
+    // -----------------------------------------------------------------------
+    inline void RenumberAndShuffle(const uint32_t* w, size_t n, uint32_t seed, bool dropNames,
+                                   std::vector<uint32_t>& out) {
+        out.clear();
+        if (!w || n < 5) return;
+
+        struct Inst { uint32_t op, wc; size_t off; };
+        std::vector<Inst> insts;
+        for (size_t i = 5; i < n;) {
+            const uint32_t wc = w[i] >> 16, op = w[i] & 0xFFFFu;
+            if (wc == 0 || i + wc > n) break;
+            if (dropNames && (op == 5 || op == 6)) { i += wc; continue; }   // OpName / OppMemberName
+            insts.push_back({ op, wc, i });
+            i += wc;
+        }
+
+        // Split into the declaration section (must stay ordered: types refer to
+        // earlier declarations) and the function section, whose instruction order
+        // inside a block is free. Another frontend legitimately emits that part in a
+        // different order, which is exactly what used to defeat the old matching.
+        std::vector<Inst> head, funcs, tail;
+        size_t fBegin = insts.size();
+        for (size_t k = 0; k < insts.size(); ++k) {
+            if (insts[k].op == 54) { fBegin = k; break; }        // OpFunction
+        }
+        size_t fEnd = fBegin;
+        if (fBegin < insts.size()) {
+            while (fEnd < insts.size() && insts[fEnd].op != 56) ++fEnd;   // OpFunctionEnd
+            if (fEnd < insts.size()) ++fEnd;
+        }
+        head.assign(insts.begin(), insts.begin() + static_cast<long>(fBegin));
+        if (fBegin < insts.size()) funcs.assign(insts.begin() + static_cast<long>(fBegin), insts.begin() + static_cast<long>(fEnd));
+        if (fEnd < insts.size()) tail.assign(insts.begin() + static_cast<long>(fEnd), insts.end());
+
+        // Deterministic PRNG so a failure can be reproduced from the log alone.
+        uint32_t rng = seed ? seed : 0x9E3779B9u;
+        auto next = [&]() { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; };
+
+        // Shuffle only the run between a block label and its terminator: that is the
+        // part whose order is free, so the module stays structurally sensible while
+        // the instruction order really changes. Order must not matter for matching.
+        size_t labelAt = funcs.size();
+        for (size_t k = 0; k < funcs.size(); ++k) if (funcs[k].op == 248) { labelAt = k; break; }
+        if (labelAt + 1 < funcs.size()) {
+            size_t bodyEnd = labelAt + 1;
+            while (bodyEnd < funcs.size() && funcs[bodyEnd].op != 253 && funcs[bodyEnd].op != 56 &&
+                   funcs[bodyEnd].op != 249 && funcs[bodyEnd].op != 250) ++bodyEnd;
+            for (size_t k = bodyEnd; k > labelAt + 1; --k)
+                std::swap(funcs[k - 1], funcs[labelAt + 1 + (next() % (k - 1 - labelAt))]);
+        }
+
+        // A module built for another capability profile also has a different amount
+        // of code. Remove a few ordinary body instructions (never the structural ones:
+        // OpFunction/OpFunctionEnd/OpLabel/OpBranch/OpReturn), which changes the size
+        // and the instruction multiset while keeping the module well formed.
+        {
+            std::vector<Inst> kept;
+            kept.reserve(funcs.size());
+            uint32_t budget = 2 + (seed % 5);
+            for (const Inst& in : funcs) {
+                const bool structural = (in.op == 54 || in.op == 56 || in.op == 248 ||
+                                         in.op == 249 || in.op == 250 || in.op == 253 ||
+                                         in.op == 252 || in.op == 251);
+                if (!structural && budget > 0 && (next() % 11) == 0) { --budget; continue; }
+                kept.push_back(in);
+            }
+            funcs.swap(kept);
+        }
+
+        // Emit everything, then rebuild with a fresh, injective id numbering: that is
+        // what makes two builds of the same shader differ the most in bytes.
+        std::vector<uint32_t> reduced;
+        reduced.insert(reduced.end(), w, w + 5);   // SPIR-V header stays intact
+        auto emit = [&](const std::vector<Inst>& v) {
+            for (const Inst& in : v) for (uint32_t k = 0; k < in.wc; ++k) reduced.push_back(w[in.off + k]);
+        };
+        emit(head); emit(funcs); emit(tail);
+        if (reduced.size() <= 5) return;
+
+        // id remap: original id -> base + sequential number (injective by construction)
+        std::unordered_map<uint32_t, uint32_t> idMap;
+        uint32_t nextId = 1 + (seed % 4093u) * 7u;
+        auto mapId = [&](uint32_t id) -> uint32_t {
+            if (id == 0) return 0;
+            auto it = idMap.find(id);
+            if (it != idMap.end()) return it->second;
+            idMap.emplace(id, nextId);
+            return nextId++;
+        };
+
+        out.assign(reduced.begin(), reduced.begin() + 5);
+        for (size_t i = 5; i + 1 < reduced.size();) {
+            const uint32_t wc = reduced[i] >> 16, op = reduced[i] & 0xFFFFu;
+            if (wc == 0 || i + wc > reduced.size()) break;
+            const size_t outStart = out.size();
+            for (uint32_t k = 0; k < wc; ++k) out.push_back(reduced[i + k]);
+            // OpEntryPoint (15) and OpName/OppMemberName (5/6) carry an id in word 1-2
+            // plus string literals; ForEachId knows which operands are ids.
+            if (op != 7 && op != 8) {
+                spvrw::ForEachId(out.data() + outStart, op, wc, [&](size_t idx, char role) {
+                    if (role == 'L' || idx >= wc) return;
+                    uint32_t& v = out[outStart + idx];
+                    v = mapId(v);
+                });
+            }
+            i += wc;
+        }
+    }
+
+    void RunReplacementSelfTest(int mode) {
+        ReplacementIndex* idx = EnsureReplacementIndex();
+        if (!idx || idx->files == 0) {
+            LogLine("SELFTEST: spv_replace is empty, nothing to check");
+            return;
+        }
+        const size_t limit = (mode >= 2) ? idx->entries.size() : (idx->entries.size() < 8 ? idx->entries.size() : 8);
+        size_t pass = 0, fail = 0, namesPass = 0, shufflePass = 0;
+        LogLine("SELFTEST: universal matching over %zu of %zu file(s) in spv_replace", limit, idx->entries.size());
+        for (size_t k = 0; k < limit; ++k) {
+            const ReplacementEntry& ref = idx->entries[k];
+            std::vector<uint32_t> words;
+            if (!ReadReplacement(ref.path, words)) continue;
+
+            // Case 1: same shader, ids renumbered, bodies shuffled, names stripped.
+            std::vector<uint32_t> variant;
+            RenumberAndShuffle(words.data(), words.size(), static_cast<uint32_t>(0x1234u + k), true, variant);
+            const char* level = nullptr;
+            ReplacementFingerprint fp;
+            const bool fpOk = spvrw::ExtractFingerprint(variant.data(), variant.size(), fp);
+            const std::wstring* pick = fpOk ? BestSimilarityMatch(idx->entries, fp, &level) : nullptr;
+            const bool ok = pick && *pick == ref.path;
+            if (ok) { ++pass; ++namesPass; } else { ++fail; }
+
+            // Case 2: names kept, ids renumbered, body shuffled only.
+            std::vector<uint32_t> variant2;
+            RenumberAndShuffle(words.data(), words.size(), static_cast<uint32_t>(0x777u + k), false, variant2);
+            ReplacementFingerprint fp2;
+            const char* level2 = nullptr;
+            const bool fpOk2 = spvrw::ExtractFingerprint(variant2.data(), variant2.size(), fp2);
+            const std::wstring* pick2 = fpOk2 ? BestSimilarityMatch(idx->entries, fp2, &level2) : nullptr;
+            const bool ok2 = pick2 && *pick2 == ref.path;
+            if (ok2) ++shufflePass;
+
+            LogLine("SELFTEST: %ls -> stripped+shuffled %s (%s), named+shuffled %s (%s)",
+                ref.path.c_str(),
+                ok ? "OK" : "FAILED", level ? level : "none",
+                ok2 ? "OK" : "FAILED", level2 ? level2 : "none");
+        }
+        if (fail == 0 && pass > 0)
+            LogLine("SELFTEST PASSED: %zu/%zu replacement(s) were still found after the module was rebuilt the way another driver would (renumbered ids, shuffled order, stripped names). The folder is portable.", pass, pass + fail);
+        else if (fail > 0)
+            LogLine("SELFTEST FAILED: %zu of %zu replacement(s) could not be found again - attach this log", fail, pass + fail);
+        else
+            LogLine("SELFTEST: could not read any replacement file, nothing tested");
+        LogLine("SELFTEST: named+shuffled %zu/%zu, stripped+shuffled %zu/%zu", shufflePass, limit, namesPass, limit);
+    }
+
     ReplacementIndex* EnsureReplacementIndex() {
         if (InterlockedCompareExchange(&g_replIndexState, 0, 0) == 2) return g_replIndex;
         AcquireSRWLockExclusive(&g_replIndexLock);
@@ -7314,6 +7486,12 @@ vkCreateInstance(const VkInstanceCreateInfo* pInfo, const VkAllocationCallbacks*
             LogLine("  INSTANCE EXT: %s", pInfo->ppEnabledExtensionNames[i]);
         for (uint32_t i = 0; i < pInfo->enabledLayerCount; ++i)
             LogLine("  INSTANCE LAYER: %s", pInfo->ppEnabledLayerNames[i]);
+    }
+    LoadSpvConfig();
+    if (g_spvCfg.selfTest > 0) {
+        static volatile LONG selfTestDone = 0;
+        if (InterlockedCompareExchange(&selfTestDone, 1, 0) == 0)
+            RunReplacementSelfTest(g_spvCfg.selfTest);
     }
     VkResult r = real(pInfo, pAllocator, pInstance);
     LogLine("vkCreateInstance result=%d", (int)r);
