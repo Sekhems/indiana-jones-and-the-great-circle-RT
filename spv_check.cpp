@@ -1748,7 +1748,7 @@ int wmain(int argc, wchar_t** argv) {
             }
         }
         vendorPass += vOk; vendorFail += (vTotal - vOk);
-        printf("  %-30ls other vendor profile:       %d/%d\n",
+        printf("  %-30s other vendor profile:       %d/%d\n",
             "", vOk, vTotal);
     }
 
