@@ -2034,7 +2034,7 @@ namespace {
     void RunReplacementSelfTest(int mode);
     // The hit counters live in spvrw; the shader path below has to bump them too.
     void NoteReplacementHit(bool exact, const char* how);
-    void NoteLookupStage(uint32_t stage);
+    void NoteModuleStage(uint32_t stage, bool replaced);
     void ScanReplacements(const wchar_t* iniPath) {
         wchar_t dir[2048]{};
         wcsncpy_s(dir, iniPath, _TRUNCATE);
@@ -5390,7 +5390,6 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         spvrw::ReplacementFingerprint fp;
         if (!spvrw::ExtractFingerprint(code, nWords, fp)) return false;
         InterlockedOr(&g_replSeenStageMask, 1L << ((fp.stage < 6) ? static_cast<int>(fp.stage) : 5));
-        InterlockedIncrement(&g_stageSeen[StageBucket(fp.stage)]);
         const ReplacementKeySet keys = MakeKeySet(fp);
         if (!keys.valid) return false;
 
@@ -5473,16 +5472,17 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     // The running totals are logged a few times, because a process that is closed by the
     // task manager never reaches DllMain(DLL_PROCESS_DETACH) and would otherwise leave no
     // verdict in the log at all.
-    // Stage of the module currently being looked up, set by the shader path. Byte-hash
-    // hits never reach FindReplacement, so without this the per-stage table reported
-    // "0 replaced" for a stage where replacements were in fact accepted.
-    volatile LONG g_lookupStage = -1;
-
-    void NoteLookupStage(uint32_t stage) { g_lookupStage = StageBucket(stage); }
+    // Called once per module the game hands over, AFTER its stage is known: byte-hash
+    // hits never reach FindReplacement, so the per-stage table has to be fed here or it
+    // reports "0 replaced" for a stage where replacements were in fact accepted.
+    void NoteModuleStage(uint32_t stage, bool replaced) {
+        const int b = StageBucket(stage);
+        if (b < 0 || b > 7) return;
+        InterlockedIncrement(&g_stageSeen[b]);
+        if (replaced) InterlockedIncrement(&g_stageHit[b]);
+    }
 
     void NoteReplacementHit(bool exact, const char* how) {
-        const long bucket = g_lookupStage;
-        if (bucket >= 0 && bucket < 8) InterlockedIncrement(&g_stageHit[bucket]);
         const long total = exact ? InterlockedIncrement(&g_replHitsExact)
                                  : InterlockedIncrement(&g_replHitsSimilar);
         if (total <= 5) {
@@ -5557,7 +5557,7 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     // forward the calls instead of moving the code out of the namespace.
     void ForgetReplacementIndexImpl() { spvrw::ForgetReplacementIndexImpl(); }
     void NoteReplacementHit(bool exact, const char* how) { spvrw::NoteReplacementHit(exact, how); }
-    void NoteLookupStage(uint32_t stage) { spvrw::NoteLookupStage(stage); }
+    void NoteModuleStage(uint32_t stage, bool replaced) { spvrw::NoteModuleStage(stage, replaced); }
     void LogReplacementSummary() { spvrw::LogReplacementSummary(); }
     void RunReplacementSelfTest(int mode) { spvrw::RunReplacementSelfTest(mode); }
 
@@ -7272,7 +7272,6 @@ vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* pInfo,
     //      whose capability profile makes the game emit an equivalent module with
     //      different ids/enums. Without this, spv_replace is silently skipped on
     //      those GPUs and the replacement lighting never appears.
-    NoteLookupStage(si.model);   // lets the per-stage table count byte-hash hits too
     if (g_replMap && !g_replMap->empty()) {
         std::wstring chosenPath;
         bool havePath = false;
@@ -7320,6 +7319,10 @@ vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* pInfo,
     SpvInfo si = AnalyzeSpirv(code, nWords, activeRt.nativeRTP, activeRt.nativeRQ, hwCaps);
     si.originalHash = originalHash;
     si.replacement = didReplace;
+    // Per-stage accounting for the summary. Done here, not in the lookup, because the
+    // stage is only known after the module is parsed and because byte-hash hits never
+    // reach the structural lookup at all.
+    NoteModuleStage(si.model, didReplace);
     static volatile LONG seen = 0;
     const LONG n = InterlockedIncrement(&seen);
 
