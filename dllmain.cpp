@@ -2034,7 +2034,7 @@ namespace {
     void RunReplacementSelfTest(int mode);
     // The hit counters live in spvrw; the shader path below has to bump them too.
     void NoteReplacementHit(bool exact, const char* how);
-    void NoteModuleStage(uint32_t stage, bool replaced);
+    void NoteModuleStage(uint32_t stage, bool replaced, bool denied);
     void ScanReplacements(const wchar_t* iniPath) {
         wchar_t dir[2048]{};
         wcsncpy_s(dir, iniPath, _TRUNCATE);
@@ -5028,7 +5028,7 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     // Per stage: how many modules the game compiled, how many the folder answered,
     // and how many lookups had a close candidate that the thresholds rejected. This is
     // what tells the user whether there is anything left to capture.
-    volatile LONG g_stageSeen[8] = {}, g_stageHit[8] = {}, g_stageClose[8] = {};
+    volatile LONG g_stageSeen[8] = {}, g_stageHit[8] = {}, g_stageClose[8] = {}, g_stageDenied[8] = {};
 
     inline int StageBucket(uint32_t stage) {
         switch (stage) {
@@ -5475,11 +5475,12 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     // Called once per module the game hands over, AFTER its stage is known: byte-hash
     // hits never reach FindReplacement, so the per-stage table has to be fed here or it
     // reports "0 replaced" for a stage where replacements were in fact accepted.
-    void NoteModuleStage(uint32_t stage, bool replaced) {
+    void NoteModuleStage(uint32_t stage, bool replaced, bool denied) {
         const int b = StageBucket(stage);
         if (b < 0 || b > 7) return;
         InterlockedIncrement(&g_stageSeen[b]);
         if (replaced) InterlockedIncrement(&g_stageHit[b]);
+        if (denied) InterlockedIncrement(&g_stageDenied[b]);
     }
 
     void NoteReplacementHit(bool exact, const char* how) {
@@ -5515,16 +5516,24 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
             }
         }
         {
+            // Print the table at a few milestones and always at the end, so the LAST table
+            // in the log is the final state. A single snapshot taken early reported
+            // "compute | 11 | 0 | ..." even though the three acceptances came later.
             static volatile LONG tableLogged = 0;
-            if (g_replMisses >= 200 && InterlockedCompareExchange(&tableLogged, 1, 0) == 0) {
-                LogLine("SPIRV SUMMARY: per stage - stage | compiled | replaced | close-but-rejected | verdict");
+            const LONG slot = InterlockedCompareExchange(&tableLogged, 0, 0);
+            const bool firstSlot = (g_replMisses >= 200 && slot < 1);
+            const bool secondSlot = (g_replMisses >= 600 && slot < 2);
+            if (firstSlot || secondSlot) {
+                InterlockedIncrement(&tableLogged);
+                LogLine("SPIRV SUMMARY: per stage - stage | compiled | replaced | close-but-rejected | verdict (counts so far)");
                 long todo = 0;
                 for (int b = 0; b < 8; ++b) {
-                    const long seen = g_stageSeen[b], hit = g_stageHit[b], close = g_stageClose[b];
+                    const long seen = g_stageSeen[b], hit = g_stageHit[b], close = g_stageClose[b], denied = g_stageDenied[b];
                     if (seen == 0) continue;
                     const char* verdict = (close > 0) ? "ACTION: a file almost matched"
                                         : (hit > 0) ? "ok"
-                                        : (seen > 0 ? "no file of this stage in the folder" : "not seen");
+                                        : (denied > 0) ? "all denied/faked, none replaced"
+                                        : "no file of this stage in the folder";
                     if (close > 0) ++todo;
                     LogLine("SPIRV SUMMARY:   %-12s | %6ld | %6ld | %6ld | %s",
                         StageBucketName(b), seen, hit, close, verdict);
@@ -5557,7 +5566,7 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     // forward the calls instead of moving the code out of the namespace.
     void ForgetReplacementIndexImpl() { spvrw::ForgetReplacementIndexImpl(); }
     void NoteReplacementHit(bool exact, const char* how) { spvrw::NoteReplacementHit(exact, how); }
-    void NoteModuleStage(uint32_t stage, bool replaced) { spvrw::NoteModuleStage(stage, replaced); }
+    void NoteModuleStage(uint32_t stage, bool replaced, bool denied) { spvrw::NoteModuleStage(stage, replaced, denied); }
     void LogReplacementSummary() { spvrw::LogReplacementSummary(); }
     void RunReplacementSelfTest(int mode) { spvrw::RunReplacementSelfTest(mode); }
 
@@ -7319,10 +7328,6 @@ vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* pInfo,
     SpvInfo si = AnalyzeSpirv(code, nWords, activeRt.nativeRTP, activeRt.nativeRQ, hwCaps);
     si.originalHash = originalHash;
     si.replacement = didReplace;
-    // Per-stage accounting for the summary. Done here, not in the lookup, because the
-    // stage is only known after the module is parsed and because byte-hash hits never
-    // reach the structural lookup at all.
-    NoteModuleStage(si.model, didReplace);
     static volatile LONG seen = 0;
     const LONG n = InterlockedIncrement(&seen);
 
@@ -7444,6 +7449,11 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
     }
     static volatile LONG deniedSeen = 0;
     const LONG dn = si.deny ? InterlockedIncrement(&deniedSeen) : 0;
+    // Per-stage accounting, with every fact final: the stage comes from the parsed
+    // module, "replaced" means a replacement module is what the driver receives, and
+    // "denied" is the module that never reaches the driver at all. Counting it earlier
+    // produced a table where compute showed 0 replaced while 3 were accepted.
+    NoteModuleStage(si.model, didReplace && !si.deny, si.deny);
     const bool logIt = g_spvCfg.logAll || (si.deny && dn <= 30) || n <= 10;
     if (g_spvCfg.dumpLookupInput > 0) {
         static volatile LONG dumpedInputs = 0;

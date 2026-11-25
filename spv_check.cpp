@@ -1318,7 +1318,7 @@ static const SpvOpDesc kSpvOps[] = {
     // Per stage: how many modules the game compiled, how many the folder answered,
     // and how many lookups had a close candidate that the thresholds rejected. This is
     // what tells the user whether there is anything left to capture.
-    volatile LONG g_stageSeen[8] = {}, g_stageHit[8] = {}, g_stageClose[8] = {};
+    volatile LONG g_stageSeen[8] = {}, g_stageHit[8] = {}, g_stageClose[8] = {}, g_stageDenied[8] = {};
 
     inline int StageBucket(uint32_t stage) {
         switch (stage) {
