@@ -278,6 +278,19 @@ try {
     & $rc.Source /nologo "/fo$resObj" $rcPath
     if ($LASTEXITCODE -ne 0) { throw "Resource Compiler (rc.exe) failed with exit code $LASTEXITCODE" }
 
+    # 2a. Дешёвая проверка областей видимости: ловит "объявлено в spvrw, использовано
+    #     снаружи без квалификатора" до того, как MSVC выдаст C2065 по одному имени за сборку.
+    $scopeCheck = Join-Path $PSScriptRoot 'tools\check_namespace_scope.py'
+    if (Test-Path $scopeCheck) {
+        $py = Get-Command python -ErrorAction SilentlyContinue
+        if (-not $py) { $py = Get-Command py -ErrorAction SilentlyContinue }
+        if ($py) {
+            & $py.Source $scopeCheck
+            if ($LASTEXITCODE -ne 0) { throw "Namespace scope check failed (see the lines above): a symbol from spvrw is used without the spvrw:: prefix or a forwarder." }
+        }
+        else { Write-Host 'python not found - skipping tools\check_namespace_scope.py' -ForegroundColor DarkYellow }
+    }
+
     # 3. Компиляция и линковка DLL (включая .obj и .res файлы)
     & $cl.Source /nologo /std:c++17 /utf-8 /EHsc /O2 /MT /LD /Zi "/I$includeDir" `
         dllmain.cpp $asmObj $resObj /link /DEBUG "/DEF:$defPath" /MACHINE:X64 "/OUT:$outDll"
