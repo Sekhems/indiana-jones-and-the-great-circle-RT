@@ -1315,6 +1315,32 @@ static const SpvOpDesc kSpvOps[] = {
     volatile LONG g_replMissStageMask = 0;
     volatile LONG g_replMissStageLogged = 0;   // 0 = not yet reported in the summary
     volatile LONG g_replSeenStageMask = 0;
+    // Per stage: how many modules the game compiled, how many the folder answered,
+    // and how many lookups had a close candidate that the thresholds rejected. This is
+    // what tells the user whether there is anything left to capture.
+    volatile LONG g_stageSeen[8] = {}, g_stageHit[8] = {}, g_stageClose[8] = {};
+
+    inline int StageBucket(uint32_t stage) {
+        switch (stage) {
+        case 0: return 0; case 1: return 1; case 2: return 2; case 3: return 3;
+        case 4: return 4; case 5: return 5; case 5267: return 6; case 5268: return 7;
+        default: return 4;   // anything unknown is treated as a fragment-style module
+        }
+    }
+
+    inline const char* StageBucketName(int b) {
+        switch (b) {
+        case 0: return "vertex";
+        case 1: return "tess-control";
+        case 2: return "tess-eval";
+        case 3: return "geometry";
+        case 4: return "fragment";
+        case 5: return "compute";
+        case 6: return "task";
+        case 7: return "mesh";
+        default: return "other";
+        }
+    }
 
     inline const char* StageBitName(int bit) {
         switch (bit) {

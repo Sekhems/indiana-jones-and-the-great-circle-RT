@@ -5024,6 +5024,32 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     volatile LONG g_replMissStageMask = 0;
     volatile LONG g_replMissStageLogged = 0;   // 0 = not yet reported in the summary
     volatile LONG g_replSeenStageMask = 0;
+    // Per stage: how many modules the game compiled, how many the folder answered,
+    // and how many lookups had a close candidate that the thresholds rejected. This is
+    // what tells the user whether there is anything left to capture.
+    volatile LONG g_stageSeen[8] = {}, g_stageHit[8] = {}, g_stageClose[8] = {};
+
+    inline int StageBucket(uint32_t stage) {
+        switch (stage) {
+        case 0: return 0; case 1: return 1; case 2: return 2; case 3: return 3;
+        case 4: return 4; case 5: return 5; case 5267: return 6; case 5268: return 7;
+        default: return 4;   // anything unknown is treated as a fragment-style module
+        }
+    }
+
+    inline const char* StageBucketName(int b) {
+        switch (b) {
+        case 0: return "vertex";
+        case 1: return "tess-control";
+        case 2: return "tess-eval";
+        case 3: return "geometry";
+        case 4: return "fragment";
+        case 5: return "compute";
+        case 6: return "task";
+        case 7: return "mesh";
+        default: return "other";
+        }
+    }
 
     inline const char* StageBitName(int bit) {
         switch (bit) {
@@ -5363,6 +5389,7 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         spvrw::ReplacementFingerprint fp;
         if (!spvrw::ExtractFingerprint(code, nWords, fp)) return false;
         InterlockedOr(&g_replSeenStageMask, 1L << ((fp.stage < 6) ? static_cast<int>(fp.stage) : 5));
+        InterlockedIncrement(&g_stageSeen[StageBucket(fp.stage)]);
         const ReplacementKeySet keys = MakeKeySet(fp);
         if (!keys.valid) return false;
 
@@ -5409,8 +5436,10 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
             }
             // Classify: a candidate only "exists" if it is at least as close as the
             // loosest tier requires. Everything else is a shader the folder does not have.
-            if (bestShape >= 0.0 && bestShape >= 0.75 && bestLayout >= 0.50)
+            if (bestShape >= 0.0 && bestShape >= 0.75 && bestLayout >= 0.50) {
                 InterlockedIncrement(&g_replMissRejected);
+                InterlockedIncrement(&g_stageClose[StageBucket(fp.stage)]);
+            }
             else {
                 InterlockedIncrement(&g_replMissNoCandidate);
                 const int bit = (fp.stage < 6) ? static_cast<int>(fp.stage) : 5;   // bucket the exotic stages
@@ -5421,6 +5450,7 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         }
 
         outPath = found;
+        InterlockedIncrement(&g_stageHit[StageBucket(fp.stage)]);
         if (how) *how = level;
         AcquireSRWLockExclusive(&g_replIndexLock);
         if (g_replIndex) g_replIndex->learned[hash] = found;
@@ -5473,6 +5503,25 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
                 }
                 LogLine("SPIRV: stages the game compiled: [%s] | stages with NO module in spv_replace: [%s]",
                     have, lack[0] ? lack : "none");
+            }
+        }
+        {
+            static volatile LONG tableLogged = 0;
+            if (g_replMisses >= 200 && InterlockedCompareExchange(&tableLogged, 1, 0) == 0) {
+                LogLine("SPIRV SUMMARY: per stage - stage | compiled | replaced | close-but-rejected | verdict");
+                long todo = 0;
+                for (int b = 0; b < 8; ++b) {
+                    const long seen = g_stageSeen[b], hit = g_stageHit[b], close = g_stageClose[b];
+                    if (seen == 0) continue;
+                    const char* verdict = (close > 0) ? "ACTION: a file almost matched"
+                                        : (hit > 0) ? "ok"
+                                                    : "no file of this stage in the folder";
+                    if (close > 0) ++todo;
+                    LogLine("SPIRV SUMMARY:   %-12s | %6ld | %6ld | %6ld | %s",
+                        StageBucketName(b), seen, hit, close, verdict);
+                }
+                if (todo == 0)
+                    LogLine("SPIRV SUMMARY: nothing in this log was rejected by the thresholds - the folder simply has no module for the stages listed as 'no file of this stage'");
             }
         }
         if (hitExact + hitSim + miss == 0)
