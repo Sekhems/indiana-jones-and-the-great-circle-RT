@@ -5394,6 +5394,22 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         InterlockedIncrement(&g_replHitsSimilar);
         (void)how;
     }
+
+    // One line at shutdown: whether the folder was actually used, or only matched in the
+    // self-test. Without it a log that ends after "SELFTEST PASSED" is ambiguous.
+    void LogReplacementSummary() {
+        const long hitExact = g_replHitsExact, hitSim = g_replHitsSimilar, miss = g_replMisses;
+        if (hitExact + hitSim + miss == 0)
+            LogLine("SPIRV SUMMARY: no shader went through the replacement lookup (self-test only, or the game never created a module)");
+        else if (hitSim > 0)
+            LogLine("SPIRV SUMMARY: PORTABLE PATH USED - %ld replacement(s) accepted by structure (%ld by exact hash, %ld rejected). This is what another GPU sees.",
+                hitSim, hitExact, miss);
+        else if (hitExact > 0)
+            LogLine("SPIRV SUMMARY: %ld replacement(s) accepted by exact hash only (%ld rejected) - structure matching was not needed on this GPU",
+                hitExact, miss);
+        else
+            LogLine("SPIRV SUMMARY: NOTHING ACCEPTED - %ld lookup(s) found no replacement; see the 'no replacement for hash=' lines above", miss);
+    }
 }   // namespace spvrw
 
     // The anonymous namespace declares these two as its entry points (see the config
@@ -5401,6 +5417,7 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     // forward the calls instead of moving the code out of the namespace.
     void ForgetReplacementIndexImpl() { spvrw::ForgetReplacementIndexImpl(); }
     void NoteReplacementHit(bool exact, const char* how) { spvrw::NoteReplacementHit(exact, how); }
+    void LogReplacementSummary() { spvrw::LogReplacementSummary(); }
     void RunReplacementSelfTest(int mode) { spvrw::RunReplacementSelfTest(mode); }
 
     // ---- SPIR-V module info ---------------------------------------------------
@@ -9968,6 +9985,7 @@ vkGetDeviceProcAddr(VkDevice device, const char* pName) {
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_DETACH && reserved != nullptr) {
         // Process is terminating: show what the game was doing last.
+        LogReplacementSummary();
         LogLine("DLL_PROCESS_DETACH: process is exiting. Last API breadcrumbs:");
         const LONG end = g_crumbIdx;
         for (int k = kCrumbCount - 16; k < kCrumbCount; ++k) {

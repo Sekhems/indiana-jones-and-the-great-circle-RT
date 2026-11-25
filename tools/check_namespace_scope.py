@@ -88,23 +88,27 @@ def declared_names(lines, start, end):
 
 
 def outer_declared(lines, start, end):
-    """Names the enclosing scope declares itself (the forwarders), which are fine."""
+    """Names the enclosing scope declares itself (the forwarders), which are fine.
+
+    Only lines at brace depth 0 or 1 belong to the enclosing scopes; anything deeper is
+    a local variable inside some function and must not count as a declaration.
+    """
     names = set()
-    depth = 0
-    for i in range(0, start):
-        stripped = lines[i].strip()
-        if stripped and not stripped.startswith(('//', '*', '/*', '#', '}')):
-            m = re.match(r'^(?:static\s+|inline\s+)*(?:[\w:<>]+[\s\*&,]+)+?\**&?(\w+)\s*[\(=;]', stripped)
-            if m:
-                names.add(m.group(1))
-        depth += lines[i].count('{') - lines[i].count('}')
-    for i in range(end + 1, len(lines)):
-        stripped = lines[i].strip()
-        if stripped and not stripped.startswith(('//', '*', '/*', '#', '}')) and depth <= 1:
-            m = re.match(r'^(?:static\s+|inline\s+)*(?:[\w:<>]+[\s\*&,]+)+?\**&?(\w+)\s*[\(=;]', stripped)
-            if m:
-                names.add(m.group(1))
-        depth += lines[i].count('{') - lines[i].count('}')
+    decl_re = re.compile(r'^(?:static\s+|inline\s+)*(?:[\w:<>]+[\s\*&,]+)+?\**&?(\w+)\s*[\(=;]')
+
+    def scan(chunk, depth):
+        for line in chunk:
+            stripped = line.strip()
+            if 1 <= depth <= 2 and stripped and not stripped.startswith(('//', '*', '/*', '#', '}')):
+                m = decl_re.match(stripped)
+                if m:
+                    names.add(m.group(1))
+            depth += line.count('{') - line.count('}')
+
+    # Before the namespace: start at depth 0.
+    scan(lines[:start], 0)
+    # After the namespace: it closes at depth 1 (the file-wide anonymous namespace).
+    scan(lines[end + 1:], 1)
     return names
 
 
