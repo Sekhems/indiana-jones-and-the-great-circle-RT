@@ -83,6 +83,27 @@ if ($noMatchAll) {
     Write-Host '    - FuzzyMatch=0 in VulkanProxy.ini disables similarity matching; this build needs it at 1' -ForegroundColor Yellow
 }
 
+Section 'Verdict on THIS machine (SPIRV SUMMARY / replacement ACCEPTED)'
+$summaries = @(Select-String -LiteralPath $log -Pattern 'SPIRV SUMMARY:')
+$liveHits  = @(Select-String -LiteralPath $log -Pattern 'SPIRV: replacement ACCEPTED \(')
+if ($summaries.Count) {
+    foreach ($m in ($summaries | Select-Object -Last 3)) { Write-Host ('  ' + $m.Line.Trim()) }
+} else {
+    Write-Host '  no SPIRV SUMMARY line: the game was closed before it created 50 shader modules, or it was closed hard.' -ForegroundColor Yellow
+}
+Write-Host ("  per-lookup accept lines: {0}" -f $liveHits.Count) -ForegroundColor ($(if ($liveHits.Count) {'Green'} else {'Yellow'}))
+foreach ($m in ($liveHits | Select-Object -First 5)) { Write-Host ('    ' + $m.Line.Trim()) -ForegroundColor Green }
+$portable = @($summaries | Where-Object { $_.Line -match 'PORTABLE PATH USED' })
+$hashOnly = @($summaries | Where-Object { $_.Line -match 'accepted by exact hash only' })
+$nothing  = @($summaries | Where-Object { $_.Line -match 'NOTHING ACCEPTED' })
+if ($portable.Count -or $liveHits.Count) {
+    Write-Host '  => RESULT: the folder is used through structural matching. This is the same path another GPU takes.' -ForegroundColor Green
+} elseif ($hashOnly.Count) {
+    Write-Host '  => RESULT: only exact hashes matched, structural matching never fired on this card. Send the log.' -ForegroundColor Yellow
+} elseif ($nothing.Count) {
+    Write-Host '  => RESULT: shaders were processed but no replacement was accepted. Send the log with the no-match lines.' -ForegroundColor Red
+}
+
 Section 'Universal matching self-test (SelfTest=1 in the ini)'
 $selfLines = @(Select-String -LiteralPath $log -Pattern 'SELFTEST')
 if ($selfLines.Count -eq 0) {
