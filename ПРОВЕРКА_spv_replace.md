@@ -100,11 +100,26 @@ Intel этот же файл тоже будет принят.
 | Строка | Что значит |
 |---|---|
 | `SPIRV SUMMARY: PORTABLE PATH USED - N replacement(s) accepted by structure...` | **это и есть proof**: замена принята по сходству, а не по точному хешу — ровно то, что делает чужая карта |
-| `SPIRV SUMMARY: N replacement(s) accepted by exact hash only` | работало только на твоей карте; на другой не сработало бы — пришли лог |
+| `SPIRV SUMMARY: N accepted (exact hash), 0 rejected, M shader(s) have no counterpart in spv_replace at all` | **норма**: замены подставлены, у остальных M шейдеров пары в папке просто нет (см. строку про стадии) |
+| `SPIRV SUMMARY: N accepted by exact hash, but M lookup(s) had a CLOSE candidate that was rejected` | **вот это надо чинить**: файл почти подошёл, но порог отверг — пришли лог |
 | `SPIRV SUMMARY: NOTHING ACCEPTED - N lookup(s) found no replacement` | игра шейдеры подала, но ни один файл не подошёл — пришли лог + строки `no replacement for hash=` |
 | `SPIRV SUMMARY: no shader went through the replacement lookup` | игра не успела создать ни одного шейдера (лог снят до запуска) или `spv_replace` не найден |
 | `SPIRV: replacement ACCEPTED (identical)` | живая строка: замена реально подставлена, вид совпадения — `identical`/`similar`/`loose` |
 | `rebuilt with another vendor's capability profile: 18/18` | (в `spv_check`) файлы узнаются даже после смены набора возможностей, как у NVIDIA/Intel |
+
+### Про строку со стадиями
+
+В логе есть строка:
+
+```
+SPIRV: stages the game compiled: [vertex fragment compute ] | stages with NO module in spv_replace: [vertex fragment ]
+```
+
+Она объясняет **все** «no counterpart» одним предложением: игра компилирует вершинные,
+фрагментные и compute-шейдеры, а в `spv_replace` лежат **только compute**. Поэтому
+вершинный или фрагментный шейдер заменить нечем — это не ошибка матчинга, файла просто нет.
+Если в твоей папке появятся вершинные/фрагментные модули (для нужных материалов), они
+подхватятся тем же путём.
 
 **Что уже проверено на твоём логе:** `SELFTEST PASSED: 3/3`, все три файла
 (`spv_74f939dce4aeb68a`, `spv_4e83efa89ef950d3`, `spv_801f80bf7bdfa946`) узнаются после
