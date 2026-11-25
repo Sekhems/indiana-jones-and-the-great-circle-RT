@@ -5068,11 +5068,16 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         idx->ready = true;
 
         g_replIndex = idx;
-        LogLine("SPIRV: replacement index: %zu file(s), %zu unreadable | exact keys names=%zu plan=%zu (ambiguous ignored: %zu/%zu) | similarity candidates=%zu",
+        size_t maxWords = 0, maxIfaces = 0;
+        for (const ReplacementEntry& e : idx->entries) {
+            if (e.fp.words > maxWords) maxWords = e.fp.words;
+            if (e.fp.interfaceCount > maxIfaces) maxIfaces = e.fp.interfaceCount;
+        }
+        LogLine("SPIRV: replacement index: %zu file(s), %zu unreadable | exact keys names=%zu plan=%zu (ambiguous ignored: %zu/%zu) | similarity candidates=%zu (largest module %zu words, up to %zu interface slots)",
             idx->files, idx->unreadable,
             idx->names.size(), idx->plan.size(),
             idx->ambNames.size(), idx->ambPlan.size(),
-            idx->entries.size());
+            idx->entries.size(), maxWords, maxIfaces);
     }
 
     ReplacementIndex* EnsureReplacementIndex() {
@@ -5127,7 +5132,7 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
             if (pick) found = *pick;
         }
         ReleaseSRWLockShared(&g_replIndexLock);
-        if (!level) return false;
+        if (!level) { InterlockedIncrement(&g_replMisses); return false; }
 
         outPath = found;
         if (how) *how = level;
