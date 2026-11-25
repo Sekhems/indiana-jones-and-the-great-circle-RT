@@ -35,7 +35,7 @@ Write-Host ("spv_replace files: {0}" -f $replCount)
 if (Test-Path $ini) {
     Section 'Effective switches (VulkanProxy.ini)'
     $keys = 'Mode','ForceVirtualRt','DenyFloat16','DenyInt16','DenyDotProduct','DenyMesh',
-            'FollowHardwareCaps','StructureMatchFallback','UseReplacements','RewriteRayQuery','TryVariants'
+            'FollowHardwareCaps','StructureMatchFallback','FuzzyMatch','UseReplacements','RewriteRayQuery','TryVariants'
     $text = Get-Content -LiteralPath $ini
     foreach ($k in $keys) {
         $line = $text | Where-Object { $_ -match "^\s*$([regex]::Escape($k))\s*=" } | Select-Object -First 1
@@ -59,22 +59,29 @@ if (-not $profile) {
 }
 
 Section 'Replacement index'
-$built = Select-String -LiteralPath $log -Pattern 'structural replacement index built' | Select-Object -Last 1
+$built = Select-String -LiteralPath $log -Pattern 'replacement index: \d+ file' | Select-Object -Last 1
 $found = Select-String -LiteralPath $log -Pattern 'replacement shader file\(s\) found' | Select-Object -Last 1
 foreach ($m in @($found, $built)) { if ($m) { Write-Host ('  ' + $m.Line.Trim()) } }
 
 Section 'Replacement results'
 $accepted = @(Select-String -LiteralPath $log -Pattern 'shader replacement ACCEPTED')
-$struct   = @(Select-String -LiteralPath $log -Pattern 'matched by STRUCTURE')
+$struct   = @(Select-String -LiteralPath $log -Pattern 'shader replacement matched \(')
 $rejected = @(Select-String -LiteralPath $log -Pattern 'shader replacement REJECTED')
 $misses   = @(Select-String -LiteralPath $log -Pattern 'no replacement for hash=')
+$noMatchAll = ($accepted.Count -eq 0 -and $misses.Count -gt 0)
 Write-Host ("  accepted  : {0}" -f $accepted.Count)
-Write-Host ("  by structure: {0}" -f $struct.Count)
+Write-Host ("  by similarity: {0}" -f $struct.Count)
 Write-Host ("  rejected  : {0}" -f $rejected.Count) -ForegroundColor ($(if ($rejected.Count) {'Yellow'} else {'Gray'}))
 Write-Host ("  no match  : {0}" -f $misses.Count)
 foreach ($m in ($accepted | Select-Object -First 8)) { Write-Host ('    ' + $m.Line.Trim()) -ForegroundColor Green }
 foreach ($m in ($struct   | Select-Object -First 8)) { Write-Host ('    ' + $m.Line.Trim()) -ForegroundColor Green }
 foreach ($m in ($rejected | Select-Object -First 8)) { Write-Host ('    ' + $m.Line.Trim()) -ForegroundColor Yellow }
+if ($noMatchAll) {
+    Write-Host '  All lookups missed: no file in spv_replace is similar to the shaders this GPU compiles.' -ForegroundColor Red
+    Write-Host '    - check that spv_replace sits next to the DLL and holds spv_<16 hex>.spv files' -ForegroundColor Yellow
+    Write-Host '    - check the "replacement index" line above: candidates=0 means none of the files could be read' -ForegroundColor Yellow
+    Write-Host '    - FuzzyMatch=0 in VulkanProxy.ini disables similarity matching; this build needs it at 1' -ForegroundColor Yellow
+}
 
 Section 'Shaders the proxy replaced with a stub (fake) module'
 $fake = @(Select-String -LiteralPath $log -Pattern '-> FAKE module \(reason=')

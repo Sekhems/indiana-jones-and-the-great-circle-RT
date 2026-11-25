@@ -1994,6 +1994,7 @@ namespace {
         // the feature), which makes the replacement map portable.
         int followHardwareCaps = 1; // honour the real driver feature bits instead of the fixed deny list
         int structureMatchFallback = 1; // second-chance matching when the byte hash differs
+        int fuzzyMatch = 1;             // similarity matching when the exact keys miss
         int forceVirtualRtByDefault = 0; // 1 = treat every GPU as "no RT at all" (old, uniform behaviour)
         int dumpSamples = 0;       // dump N working compute shaders of two kinds (for comparison with crashing ones)
         int serializeCompile = 1; // one thread at a time inside driver shader/pipeline compilation
@@ -2024,16 +2025,9 @@ namespace {
         return h;
     }
     std::unordered_map<uint64_t, std::wstring>* g_replMap = nullptr;
-    // ---- structure-aware replacement index (see spvrw::StructuralSignature) ----
-    // Declared here because the configuration loader (below) has to invalidate the
-    // index when it re-reads spv_replace.
-    std::unordered_map<std::string, std::wstring>* g_replStructMap = nullptr;
-    std::unordered_set<std::string>* g_replStructAmbiguous = nullptr;
-    std::unordered_map<uint64_t, std::wstring>* g_replMatchCache = nullptr;
-    SRWLOCK g_replStructLock = SRWLOCK_INIT;
-    volatile LONG g_replStructState = 0;   // 0 = not built, 2 = ready
-    volatile LONG g_replStructHits = 0;
-    volatile LONG g_replHashHits = 0;
+    // The replacement index is declared later (see FindReplacement); the config
+    // loader invalidates it there.
+    void ForgetReplacementIndex();
     void ScanReplacements(const wchar_t* iniPath) {
         wchar_t dir[2048]{};
         wcsncpy_s(dir, iniPath, _TRUNCATE);
@@ -2130,6 +2124,7 @@ namespace {
         g_spvCfg.traceReplacementShaders = rd(L"TraceReplacementShaders", 0);
         g_spvCfg.followHardwareCaps = rd(L"FollowHardwareCaps", 1);
         g_spvCfg.structureMatchFallback = rd(L"StructureMatchFallback", 1);
+        g_spvCfg.fuzzyMatch = rd(L"FuzzyMatch", 1);
         InterlockedExchange(&g_uniformShaderProfile, rd(L"UniformShaderProfile", 0));
         g_spvCfg.forceVirtualRtByDefault = rd(L"ForceVirtualRt", 0);
         g_spvCfg.tryVariants = rd(L"TryVariants", 1);
@@ -2188,17 +2183,13 @@ namespace {
         if (g_spvCfg.useReplacements) {
             ScanReplacements(path);
             // The ini (and therefore spv_replace) may be re-read; drop the derived
-            // indexes so they are rebuilt from the folder that is on disk now.
-            // Only invalidated afterwards: the lazy builders below hold the lock while
-            // they publish g_replStructState = 2, so a concurrent lookup can never see
-            // "ready" together with a half-built index.
-            InterlockedExchange(&g_replStructState, 0);
-            delete g_replStructMap;         g_replStructMap = nullptr;
-            delete g_replStructAmbiguous;   g_replStructAmbiguous = nullptr;
-            delete g_replMatchCache;        g_replMatchCache = nullptr;
+            // index so it is rebuilt from the folder that is on disk now. The lazy
+            // builder publishes "ready" while holding the lock, so a concurrent
+            // lookup can never observe a half-built index.
+            ForgetReplacementIndex();
         }
-        LogLine("SPIRV: FollowHardwareCaps=%d StructureMatchFallback=%d UniformShaderProfile=%d ForceVirtualRt=%d",
-            g_spvCfg.followHardwareCaps, g_spvCfg.structureMatchFallback,
+        LogLine("SPIRV: FollowHardwareCaps=%d StructureMatchFallback=%d FuzzyMatch=%d UniformShaderProfile=%d ForceVirtualRt=%d",
+            g_spvCfg.followHardwareCaps, g_spvCfg.structureMatchFallback, g_spvCfg.fuzzyMatch,
             (int)g_uniformShaderProfile, g_spvCfg.forceVirtualRtByDefault);
         LogLine("SPIRV config (%ls): DenyFloat16=%d DenyInt16=%d DenyDotProduct=%d DenyRayTracing=%d RewriteRayQuery=%d DenyMesh=%d PatchVersion=%d LogAll=%d Serialize=%d Catch=%d DenyComputeAll=%d caps Brightness=%.2f",
             path, g_spvCfg.denyFloat16, g_spvCfg.denyInt16, g_spvCfg.denyDotProduct,
@@ -4755,90 +4746,405 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
 }
 
     // -----------------------------------------------------------------------
-    // Second-chance replacement lookup.
+    // Universal replacement lookup.
     //
-    // Primary key: FNV-1a of the exact module bytes the game supplied (works
-    // when the game generates byte-identical modules, e.g. the reference GCN2
-    // machine the replacements were made on).
-    // Secondary key: spvrw::StructuralSignature, which ignores ids, decorations,
-    // enum literals, extension strings and ray-tracing code. This makes the same
-    // spv_replace folder work on NVIDIA/Intel/AMD cards whose driver-capability
-    // profile makes the game emit a slightly different but equivalent module.
+    // Why the byte hash and even the order-sensitive structural signature are not
+    // enough: every machine can receive a different build of the same shader. The
+    // log from a GTX 1080 Ti shows the 3 replacement files never matching while the
+    // game supplies 10 different modules for the same material set. A mismatch
+    // cannot be recovered from the bytes alone, so the lookup degrades step by step,
+    // each step being strictly typed so a replacement for another shader is never
+    // used:
+    //
+    //   exact     - FNV-1a of the bytes the game supplied (reference machine)
+    //   names/plan- identical entry point + debug names + descriptor interface
+    //   identical - same instruction multiset and same interface
+    //   similar   - same shader with a small build difference
+    //   loose     - same shader with heavy divergence (different capability profile,
+    //               ray-tracing code lowered on one side only)
+    //
+    // The decisive signal is the instruction multiset (order independent!) and the
+    // debug names, which come from the shader source and are therefore identical on
+    // every GPU. The execution model is always part of the comparison, so a vertex
+    // shader can never be replaced by a fragment or compute module.
     // -----------------------------------------------------------------------
-    void BuildStructuralReplacementIndexLocked() {
-        auto* index = new std::unordered_map<std::string, std::wstring>();
-        auto* ambiguous = new std::unordered_set<std::string>();
-        size_t unreadable = 0, skipped = 0, duplicates = 0;
-        if (g_replMap) {
-            for (const auto& kv : *g_replMap) {
-                std::vector<uint32_t> words;
-                if (!ReadReplacement(kv.second, words)) { ++unreadable; continue; }
-                std::string err;
-                if (!ValidateReplacementEnvelope(words, err)) { ++unreadable; continue; }
-                size_t insts = 0;
-                bool hasRt = false;
-                const std::string sig = spvrw::StructuralSignature(words.data(), words.size(), &insts, &hasRt);
-                if (sig.empty() || insts < 8) { ++skipped; continue; }
-                auto ins = index->emplace(sig, kv.second);
-                if (!ins.second) {
-                    // Two different originals reduce to the same shape. Substituting one for
-                    // the other could change behaviour, so such shapes are never matched.
-                    if (ambiguous->insert(sig).second) ++duplicates;
-                }
+
+    // Everything that identifies "the same shader" without depending on the exact
+    // bytes a particular driver-capability profile produced.
+    struct ReplacementFingerprint {
+        uint32_t stage = 0xFFFFFFFFu;
+        std::string norm;
+        std::string names;
+        std::string layout;
+        std::map<uint64_t, uint32_t> shapeHistogram;   // instruction shape -> count
+        size_t words = 0;
+        size_t interfaceCount = 0;
+    };
+
+    // Cosine similarity of two integer histograms, in [0,1]. Independent of ids, of
+    // the instruction order and of the module length.
+    inline double HistogramSimilarity(const std::map<uint64_t, uint32_t>& a,
+                                     const std::map<uint64_t, uint32_t>& b) {
+        if (a.empty() || b.empty()) return 0.0;
+        double dot = 0.0, na = 0.0, nb = 0.0;
+        for (const auto& kv : a) {
+            na += double(kv.second) * double(kv.second);
+            auto it = b.find(kv.first);
+            if (it != b.end()) dot += double(kv.second) * double(it->second);
+        }
+        for (const auto& kv : b) nb += double(kv.second) * double(kv.second);
+        if (na <= 0.0 || nb <= 0.0) return 0.0;
+        return dot / (std::sqrt(na) * std::sqrt(nb));
+    }
+
+    // Splits a "name1|name2|" list into a set.
+    inline void SplitNames(const std::string& s, std::unordered_set<std::string>& out) {
+        size_t start = 0;
+        while (start < s.size()) {
+            size_t end = s.find('|', start);
+            if (end == std::string::npos) end = s.size();
+            if (end > start) out.insert(s.substr(start, end - start));
+            start = end + 1;
+        }
+    }
+
+    // Jaccard overlap of two interface-layout key strings.
+    inline double LayoutSimilarity(const std::string& a, const std::string& b) {
+        if (a.empty() && b.empty()) return 1.0;
+        std::unordered_set<std::string> sa, sb;
+        SplitNames(a, sa);   // layout keys are also ';'-separated; split below
+        sa.clear(); sb.clear();
+        auto split = [](const std::string& s, char sep, std::unordered_set<std::string>& out) {
+            size_t start = 0;
+            while (start < s.size()) {
+                size_t end = s.find(sep, start);
+                if (end == std::string::npos) end = s.size();
+                if (end > start) out.insert(s.substr(start, end - start));
+                start = end + 1;
+            }
+        };
+        split(a, ';', sa); split(b, ';', sb);
+        if (sa.empty() && sb.empty()) return 1.0;
+        size_t inter = 0;
+        for (const std::string& k : sa) if (sb.count(k)) ++inter;
+        const size_t uni = sa.size() + sb.size() - inter;
+        return uni ? double(inter) / double(uni) : 0.0;
+    }
+
+    // Extracts a SPIR-V literal string (OpName / OpExtension / OpExtInstImport).
+    inline std::string LiteralString(const uint32_t* w, uint32_t wc) {
+        std::string out;
+        for (uint32_t k = 0; k < wc; ++k) {
+            for (unsigned b = 0; b < 4; ++b) {
+                const char c = static_cast<char>((w[k] >> (b * 8)) & 0xFFu);
+                if (c == 0) return out;
+                out.push_back(c);
             }
         }
-        for (const std::string& sig : *ambiguous) index->erase(sig);
-
-        g_replStructMap = index;
-        g_replStructAmbiguous = ambiguous;
-        LogLine("SPIRV: structural replacement index built: %zu unique signature(s), %zu ambiguous (ignored), %zu unreadable, %zu skipped",
-            g_replStructMap->size(), ambiguous->size(), unreadable, skipped);
-        (void)duplicates;
+        return out;
     }
 
-    // Returns the replacement path for a module whose byte hash is not in the map.
-    bool LookupStructuralReplacement(const uint32_t* code, size_t nWords, std::wstring& outPath) {
-        if (!g_spvCfg.structureMatchFallback || !g_replMap || g_replMap->empty()) return false;
-        if (!code || nWords < 5) return false;
+    inline bool ExtractFingerprint(const uint32_t* w, size_t n, ReplacementFingerprint& fp) {
+        fp = ReplacementFingerprint{};
+        if (!w || n < 5 || w[0] != 0x07230203u) return false;
+        fp.words = n;
+        fp.norm = spvrw::StructuralSignature(w, n);
 
-        if (InterlockedCompareExchange(&g_replStructState, 0, 0) != 2) {
-            AcquireSRWLockExclusive(&g_replStructLock);
-            if (g_replStructState != 2) { BuildStructuralReplacementIndexLocked(); g_replStructState = 2; }
-            ReleaseSRWLockExclusive(&g_replStructLock);
+        std::map<uint32_t, uint32_t> setOf, bindingOf, locationOf;
+        std::vector<std::string> nameList;
+        std::vector<std::pair<uint32_t, uint32_t>> variables;   // resultId, storageClass
+
+        for (size_t i = 5; i < n;) {
+            const uint32_t wc = w[i] >> 16, op = w[i] & 0xFFFFu;
+            if (wc == 0 || i + wc > n) break;
+            const uint32_t* b = w + i;
+            if (op == 15 && wc >= 3 && fp.stage == 0xFFFFFFFFu) {        // OpEntryPoint
+                fp.stage = b[1];
+            } else if (op == 5 && wc >= 3) {                            // OpName
+                nameList.push_back(LiteralString(b + 2, wc - 2));
+            } else if (op == 6 && wc >= 4) {                            // OppMemberName
+                nameList.push_back(LiteralString(b + 3, wc - 3));
+            } else if (op == 71 && wc >= 4) {                           // OpDecorate
+                const uint32_t target = b[1], dec = b[2];
+                if (dec == 34) setOf[target] = b[3];                    // DescriptorSet
+                else if (dec == 33) bindingOf[target] = b[3];           // Binding
+                else if (dec == 30) locationOf[target] = b[3];          // Location
+            } else if (op == 59 && wc >= 4) {                           // OpVariable
+                variables.push_back({ b[2], b[3] });
+            }
+
+            // Order-independent structural shape of this instruction: the opcode
+            // plus, for every operand, whether it is an id ("I") or a literal ("L").
+            // Ids and literal values are dropped, so the same shader built by a
+            // different frontend or for a different capability profile keeps the same
+            // set of shapes. Ray-tracing code is excluded because our own lowering may
+            // remove it on one machine and not on another.
+            const bool rtOp = spvrw::IsRayTracingOpForSignature(op);
+            const bool rtCap = (op == 17 && wc >= 2 && spvrw::IsRayTracingCapability(w[i + 1]));
+            if (!rtOp && !rtCap) {
+                std::vector<char> roles(wc, 'L');
+                spvrw::ForEachId(w + i, op, wc, [&](size_t idx, char) { if (idx < roles.size()) roles[idx] = 'I'; });
+                uint64_t h = 0xcbf29ce484222325ull;
+                auto mixByte = [&](uint8_t byte) { h ^= byte; h *= 0x100000001b3ull; };
+                mixByte(static_cast<uint8_t>(op & 0xFF));
+                mixByte(static_cast<uint8_t>(op >> 8));
+                for (uint32_t k = 1; k < wc; ++k) mixByte(static_cast<uint8_t>(roles[k]));
+                ++fp.shapeHistogram[h];
+            }
+            i += wc;
         }
-        if (!g_replStructMap || g_replStructMap->empty()) return false;
 
-        size_t insts = 0;
-        bool hasRt = false;
-        const std::string sig = spvrw::StructuralSignature(code, nWords, &insts, &hasRt);
-        if (sig.empty() || insts < 8) return false;
+        std::sort(nameList.begin(), nameList.end());
+        nameList.erase(std::unique(nameList.begin(), nameList.end()), nameList.end());
+        for (const std::string& nm : nameList) { fp.names += nm; fp.names += '|'; }
 
-        AcquireSRWLockShared(&g_replStructLock);
-        auto it = g_replStructMap->find(sig);
-        const bool found = it != g_replStructMap->end();
-        if (found) outPath = it->second;
-        ReleaseSRWLockShared(&g_replStructLock);
-        return found;
+        std::vector<std::string> keys;
+        keys.reserve(variables.size());
+        for (const auto& v : variables) {
+            const uint32_t resultId = v.first, storageClass = v.second;
+            if (storageClass == 6 || storageClass == 7) continue;   // Private / Function
+            char key[96];
+            auto sit = setOf.find(resultId), bit = bindingOf.find(resultId);
+            auto lit = locationOf.find(resultId);
+            if (sit != setOf.end() || bit != bindingOf.end()) {
+                _snprintf_s(key, sizeof(key), _TRUNCATE, "D%u:%u:%u",
+                    storageClass,
+                    sit != setOf.end() ? sit->second : 0xFFFFFFFFu,
+                    bit != bindingOf.end() ? bit->second : 0xFFFFFFFFu);
+            } else {
+                _snprintf_s(key, sizeof(key), _TRUNCATE, "L%u:%u",
+                    storageClass,
+                    lit != locationOf.end() ? lit->second : 0xFFFFFFFFu);
+            }
+            keys.push_back(key);
+        }
+        std::sort(keys.begin(), keys.end());
+        keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+        fp.interfaceCount = keys.size();
+        for (const std::string& k : keys) { fp.layout += k; fp.layout += ';'; }
+        return !fp.norm.empty();
     }
 
-    // Learned hash -> file mapping. Once a module with hash Y has been matched
-    // structurally to a replacement we remember it, so the signature is computed
-    // only once per distinct module instead of once per pipeline permutation.
-    bool LookupCachedReplacement(uint64_t hash, std::wstring& outPath) {
-        if (!g_replMatchCache) return false;
-        AcquireSRWLockShared(&g_replStructLock);
-        auto it = g_replMatchCache->find(hash);
-        const bool found = it != g_replMatchCache->end();
-        if (found) outPath = it->second;
-        ReleaseSRWLockShared(&g_replStructLock);
-        return found;
+    // Portable keys: the descriptor interface (which the pipeline layout requires
+    // anyway) plus the debug names. Instruction order is never part of a key.
+    struct ReplacementKeySet {
+        std::string names;
+        std::string plan;
+        bool valid = false;
+        uint32_t stage = 0xFFFFFFFFu;
+    };
+
+    inline ReplacementKeySet MakeKeySet(const spvrw::ReplacementFingerprint& fp) {
+        ReplacementKeySet k;
+        if (fp.norm.empty()) return k;
+        k.valid = true;
+        k.stage = fp.stage;
+        char buf[64];
+        _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%u#", fp.stage);
+        k.plan = buf;  k.plan += fp.layout;
+        k.names = k.plan;  k.names += '#'; k.names += fp.names;
+        return k;
     }
 
-    void RememberReplacementMatch(uint64_t hash, const std::wstring& path) {
-        AcquireSRWLockExclusive(&g_replStructLock);
-        if (!g_replMatchCache) g_replMatchCache = new std::unordered_map<uint64_t, std::wstring>();
-        (*g_replMatchCache)[hash] = path;
-        ReleaseSRWLockExclusive(&g_replStructLock);
+    struct ReplacementEntry {
+        std::wstring path;
+        uint32_t stage = 0xFFFFFFFFu;
+        spvrw::ReplacementFingerprint fp;
+    };
+
+    struct ReplacementIndex {
+        std::unordered_map<std::string, std::wstring> names;
+        std::unordered_map<std::string, std::wstring> plan;
+        std::unordered_set<std::string> ambNames, ambPlan;
+        std::unordered_map<uint64_t, std::wstring> learned;   // hash -> file
+        std::vector<ReplacementEntry> entries;
+        size_t files = 0, unreadable = 0;
+        bool ready = false;
+    };
+
+    // kFuzzyMargin keeps two equally plausible candidates from being swapped.
+    constexpr double kFuzzyMargin = 0.05;
+
+    ReplacementIndex* g_replIndex = nullptr;
+    SRWLOCK g_replIndexLock = SRWLOCK_INIT;
+    volatile LONG g_replIndexState = 0;
+    volatile LONG g_replHitsExact = 0, g_replHitsSimilar = 0, g_replMisses = 0;
+
+    void AddToIndex(std::unordered_map<std::string, std::wstring>& m,
+                    std::unordered_set<std::string>& ambiguous,
+                    const std::string& key, const std::wstring& path) {
+        if (key.empty()) return;
+        auto it = m.find(key);
+        if (it == m.end()) { m.emplace(key, path); return; }
+        if (it->second != path) ambiguous.insert(key);   // never guess between two shaders
+    }
+
+    // Chooses the replacement for one incoming module by similarity. The tiers go
+    // from strict to loose:
+    //
+    //   identical - same instruction multiset and descriptor interface
+    //   similar   - same shader after a small build difference
+    //   loose     - same shader with heavy divergence (different capability profile,
+    //               ray-tracing code lowered on one side only)
+    //
+    // Debug names are the decisive signal: they come from the shader source, so they
+    // are identical for the same shader on every GPU and different for a different
+    // shader even when the descriptor interface coincides. When one of the modules
+    // carries no names at all (stripped build) the name gate is skipped instead of
+    // failing the match. The best candidate must also beat the runner-up by
+    // kFuzzyMargin, otherwise nothing is picked.
+    inline const std::wstring* BestSimilarityMatch(const std::vector<ReplacementEntry>& entries,
+                                                  const ReplacementFingerprint& fp,
+                                                  const char** matchedLevel) {
+        if (matchedLevel) *matchedLevel = nullptr;
+        struct Tier { double shape, layout, names; const char* name; };
+        const Tier tiers[] = {
+            { 0.980, 1.00, 1.00, "identical" },
+            { 0.900, 0.75, 0.50, "similar" },
+            { 0.750, 0.50, 0.34, "loose" },
+        };
+        for (const Tier& tier : tiers) {
+            double best = -1.0, second = -1.0;
+            const std::wstring* bestPath = nullptr;
+            for (const ReplacementEntry& e : entries) {
+                if (e.stage != fp.stage) continue;
+                const double shape = HistogramSimilarity(fp.shapeHistogram, e.fp.shapeHistogram);
+                if (shape < tier.shape) continue;
+                const double lay = LayoutSimilarity(fp.layout, e.fp.layout);
+                if (lay < tier.layout) continue;
+
+                std::unordered_set<std::string> mine, theirs;
+                SplitNames(fp.names, mine);
+                SplitNames(e.fp.names, theirs);
+                double namesScore = 0.0;
+                if (!mine.empty() && !theirs.empty()) {
+                    size_t inter = 0;
+                    for (const std::string& nm : mine) if (theirs.count(nm)) ++inter;
+                    const size_t uni = mine.size() + theirs.size() - inter;
+                    namesScore = uni ? double(inter) / double(uni) : 0.0;
+                    if (namesScore < tier.names) continue;
+                }
+
+                const double score = shape + lay + namesScore;
+                if (score > best) { second = best; best = score; bestPath = &e.path; }
+                else if (score > second) { second = score; }
+            }
+            if (bestPath && (second < 0.0 || best - second >= kFuzzyMargin)) {
+                if (matchedLevel) *matchedLevel = tier.name;
+                return bestPath;
+            }
+        }
+        return nullptr;
+    }
+
+    void BuildReplacementIndexLocked() {
+        auto* idx = new ReplacementIndex();
+        if (g_replMap) {
+            idx->files = g_replMap->size();
+            idx->entries.reserve(idx->files);
+            for (const auto& kv : *g_replMap) {
+                std::vector<uint32_t> words;
+                if (!ReadReplacement(kv.second, words)) { ++idx->unreadable; continue; }
+                std::string err;
+                if (!ValidateReplacementEnvelope(words, err)) { ++idx->unreadable; continue; }
+                spvrw::ReplacementFingerprint fp;
+                if (!spvrw::ExtractFingerprint(words.data(), words.size(), fp)) { ++idx->unreadable; continue; }
+                const ReplacementKeySet keys = MakeKeySet(fp);
+                if (!keys.valid) { ++idx->unreadable; continue; }
+                // The pipeline layout has to match for the replacement to be usable at
+                // all, so an interface shared by two different replacement files is a
+                // genuine conflict: drop it rather than guess.
+                AddToIndex(idx->plan,  idx->ambPlan,  keys.plan,  kv.second);
+                AddToIndex(idx->names, idx->ambNames, keys.names, kv.second);
+                ReplacementEntry entry;
+                entry.path = kv.second;
+                entry.stage = fp.stage;
+                entry.fp = std::move(fp);
+                idx->entries.push_back(std::move(entry));
+            }
+        }
+        for (const std::string& k : idx->ambPlan)  idx->plan.erase(k);
+        for (const std::string& k : idx->ambNames) idx->names.erase(k);
+        idx->ready = true;
+
+        g_replIndex = idx;
+        LogLine("SPIRV: replacement index: %zu file(s), %zu unreadable | exact keys names=%zu plan=%zu (ambiguous ignored: %zu/%zu) | similarity candidates=%zu",
+            idx->files, idx->unreadable,
+            idx->names.size(), idx->plan.size(),
+            idx->ambNames.size(), idx->ambPlan.size(),
+            idx->entries.size());
+    }
+
+    ReplacementIndex* EnsureReplacementIndex() {
+        if (InterlockedCompareExchange(&g_replIndexState, 0, 0) == 2) return g_replIndex;
+        AcquireSRWLockExclusive(&g_replIndexLock);
+        if (g_replIndexState != 2) { BuildReplacementIndexLocked(); g_replIndexState = 2; }
+        ReleaseSRWLockExclusive(&g_replIndexLock);
+        return g_replIndex;
+    }
+
+    // Finds the replacement for one incoming module. Returns false when nothing
+    // plausible is in spv_replace for it (the original module is then kept).
+    bool FindReplacement(const uint32_t* code, size_t nWords, uint64_t hash,
+                         std::wstring& outPath, const char** how) {
+        if (how) *how = "none";
+        if (hash == 0 || !g_spvCfg.structureMatchFallback) return false;
+        ReplacementIndex* idx = EnsureReplacementIndex();
+        if (!idx || !idx->ready || idx->files == 0) return false;
+
+        // Learned mapping from an earlier identical lookup (cheap and exact).
+        {
+            AcquireSRWLockShared(&g_replIndexLock);
+            auto it = idx->learned.find(hash);
+            if (it != idx->learned.end()) {
+                outPath = it->second;
+                ReleaseSRWLockShared(&g_replIndexLock);
+                if (how) *how = "learned";
+                return true;
+            }
+            ReleaseSRWLockShared(&g_replIndexLock);
+        }
+
+        spvrw::ReplacementFingerprint fp;
+        if (!spvrw::ExtractFingerprint(code, nWords, fp)) return false;
+        const ReplacementKeySet keys = MakeKeySet(fp);
+        if (!keys.valid) return false;
+
+        const char* level = nullptr;
+        std::wstring found;
+        AcquireSRWLockShared(&g_replIndexLock);
+        auto probe = [&](const std::unordered_map<std::string, std::wstring>& m,
+                         const std::string& key, const char* name) {
+            if (level || key.empty()) return;
+            auto it = m.find(key);
+            if (it != m.end()) { found = it->second; level = name; }
+        };
+        probe(idx->names, keys.names, "names");
+        probe(idx->plan,  keys.plan,  "plan");
+
+        if (!level && g_spvCfg.fuzzyMatch) {
+            const std::wstring* pick = BestSimilarityMatch(idx->entries, fp, &level);
+            if (pick) found = *pick;
+        }
+        ReleaseSRWLockShared(&g_replIndexLock);
+        if (!level) return false;
+
+        outPath = found;
+        if (how) *how = level;
+        AcquireSRWLockExclusive(&g_replIndexLock);
+        if (g_replIndex) g_replIndex->learned[hash] = found;
+        ReleaseSRWLockExclusive(&g_replIndexLock);
+        return true;
+    }
+
+    void ForgetReplacementIndex() {
+        InterlockedExchange(&g_replIndexState, 0);
+        ReplacementIndex* stale = nullptr;
+        AcquireSRWLockExclusive(&g_replIndexLock);
+        stale = g_replIndex;
+        g_replIndex = nullptr;
+        ReleaseSRWLockExclusive(&g_replIndexLock);
+        delete stale;
     }
 
     // ---- SPIR-V module info ---------------------------------------------------
@@ -6561,19 +6867,14 @@ vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* pInfo,
         if (it != g_replMap->end()) {
             chosenPath = it->second;
             havePath = true;
-            InterlockedIncrement(&g_replHashHits);
-        } else if (LookupCachedReplacement(originalHash, chosenPath)) {
+            InterlockedIncrement(&g_replHitsExact);
+        } else if (FindReplacement(originalCode, nWords, originalHash, chosenPath, &matchKind)) {
             havePath = true;
-            matchKind = "hash-cached";
-        } else if (LookupStructuralReplacement(originalCode, nWords, chosenPath)) {
-            havePath = true;
-            matchKind = "structure";
-            RememberReplacementMatch(originalHash, chosenPath);
-            InterlockedIncrement(&g_replStructHits);
-            static volatile LONG structLogs = 0;
-            if (InterlockedIncrement(&structLogs) <= 20)
-                LogLine("SPIRV: shader replacement matched by STRUCTURE hash=%016llX (byte hash differs on this GPU); module is equivalent to the original",
-                    static_cast<unsigned long long>(originalHash));
+            InterlockedIncrement(&g_replHitsSimilar);
+            static volatile LONG matchLogs = 0;
+            if (InterlockedIncrement(&matchLogs) <= 24)
+                LogLine("SPIRV: shader replacement matched (%s) hash=%016llX - this GPU builds the module differently, substituting the equivalent spv_replace module",
+                    matchKind, static_cast<unsigned long long>(originalHash));
         }
 
         if (havePath) {
@@ -6594,7 +6895,7 @@ vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* pInfo,
         } else {
             static volatile LONG misses = 0;
             if (InterlockedIncrement(&misses) <= 15)
-                LogLine("SPIRV: no replacement for hash=%016llX (neither the byte hash nor the structural signature matched spv_replace)",
+                LogLine("SPIRV: no replacement for hash=%016llX (spv_replace has no module of the same stage/interface; see the replacement index line at startup)",
                     static_cast<unsigned long long>(originalHash));
         }
     }
