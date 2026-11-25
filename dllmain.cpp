@@ -5387,12 +5387,16 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     }
 
     // Counts a replacement the byte hash or the structural lookup accepted. `how` is the
-    // tier reported by FindReplacement ("names"/"plan"/"identical"/"similar"/"loose"), and
-    // it is logged so the exact tier is visible in the diagnostic log.
+    // tier reported by FindReplacement ("names"/"plan"/"identical"/"similar"/"loose").
+    // The running totals are logged a few times, because a process that is closed by the
+    // task manager never reaches DllMain(DLL_PROCESS_DETACH) and would otherwise leave no
+    // verdict in the log at all.
     void NoteReplacementHit(bool exact, const char* how) {
-        if (exact) { InterlockedIncrement(&g_replHitsExact); return; }
-        InterlockedIncrement(&g_replHitsSimilar);
-        (void)how;
+        const long total = exact ? InterlockedIncrement(&g_replHitsExact)
+                                 : InterlockedIncrement(&g_replHitsSimilar);
+        if (total <= 5)
+            LogLine("SPIRV: replacement ACCEPTED (%s) - structural matching is in use on this GPU (%ld accepted so far)",
+                how ? how : "?", total);
     }
 
     // One line at shutdown: whether the folder was actually used, or only matched in the
@@ -7301,6 +7305,10 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
     const LONG dn = si.deny ? InterlockedIncrement(&deniedSeen) : 0;
     const bool logIt = g_spvCfg.logAll || (si.deny && dn <= 30) || n <= 10;
     if (n % 200 == 0) LogLine("SHADER stats: total=%ld denied=%ld", n, (long)deniedSeen);
+    // A summary every 50 modules: the definitive one is logged at process detach, but a
+    // game that is force-closed (or crashes) never gets there, and then the log has no
+    // verdict at all even though shaders were processed.
+    if (n % 50 == 0) LogReplacementSummary();
     if (logIt)
         LogLine("SHADER #%ld spv=%u.%u model=%u size=%zu source=%s caps=[%s]%s%s", n,
             (si.version >> 16) & 0xFF, (si.version >> 8) & 0xFF, si.model, nWords * sizeof(uint32_t),
@@ -9985,6 +9993,9 @@ vkGetDeviceProcAddr(VkDevice device, const char* pName) {
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_DETACH && reserved != nullptr) {
         // Process is terminating: show what the game was doing last.
+        // This branch only runs on a normal exit. If the game is force-closed, or the
+        // loader unloads the proxy early, nothing here executes - that is why the
+        // per-lookup lines above exist as well.
         LogReplacementSummary();
         LogLine("DLL_PROCESS_DETACH: process is exiting. Last API breadcrumbs:");
         const LONG end = g_crumbIdx;
