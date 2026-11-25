@@ -5014,6 +5014,10 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     SRWLOCK g_replIndexLock = SRWLOCK_INIT;
     volatile LONG g_replIndexState = 0;
     volatile LONG g_replHitsExact = 0, g_replHitsSimilar = 0, g_replMisses = 0;
+    // Why a lookup missed: no module of this stage is even close (expected - the folder
+    // holds a handful of files, the game compiles hundreds), or a plausible candidate
+    // was rejected by the thresholds (actionable).
+    volatile LONG g_replMissNoCandidate = 0, g_replMissRejected = 0;
 
     void AddToIndex(std::unordered_map<std::string, std::wstring>& m,
                     std::unordered_set<std::string>& ambiguous,
@@ -5309,6 +5313,13 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     }
 
 
+    // Debug names are stored '|'-terminated, so count the separators.
+    inline size_t CountNameTokens(const std::string& names) {
+        size_t n = 0;
+        for (char c : names) if (c == '|') ++n;
+        return n;
+    }
+
     // Finds the replacement for one incoming module. Returns false when nothing
     // plausible is in spv_replace for it (the original module is then kept).
     bool FindReplacement(const uint32_t* code, size_t nWords, uint64_t hash,
@@ -5374,9 +5385,15 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
                     LogLine("SPIRV: no replacement for hash=%016llX - stage %u (%s) not present in spv_replace at all",
                         static_cast<unsigned long long>(hash), fp.stage, SpvStageName(fp.stage));
                 else
-                    LogLine("SPIRV: no replacement for hash=%016llX - closest %ls: shape=%.3f layout=%.2f (need shape>=0.75, layout>=0.50 at the loosest level)",
-                        static_cast<unsigned long long>(hash), bestName, bestShape, bestLayout);
+                    LogLine("SPIRV: no replacement for hash=%016llX - closest %ls: shape=%.3f layout=%.2f names=%zu (need shape>=0.97 layout>=1.00/0.75/0.50; without debug names the margin gate also applies)",
+                        static_cast<unsigned long long>(hash), bestName, bestShape, bestLayout, CountNameTokens(fp.names));
             }
+            // Classify: a candidate only "exists" if it is at least as close as the
+            // loosest tier requires. Everything else is a shader the folder does not have.
+            if (bestShape >= 0.0 && bestShape >= 0.75 && bestLayout >= 0.50)
+                InterlockedIncrement(&g_replMissRejected);
+            else
+                InterlockedIncrement(&g_replMissNoCandidate);
             InterlockedIncrement(&g_replMisses);
             return false;
         }
@@ -5407,23 +5424,35 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     void NoteReplacementHit(bool exact, const char* how) {
         const long total = exact ? InterlockedIncrement(&g_replHitsExact)
                                  : InterlockedIncrement(&g_replHitsSimilar);
-        if (total <= 5)
-            LogLine("SPIRV: replacement ACCEPTED (%s) - structural matching is in use on this GPU (%ld accepted so far)",
-                how ? how : "?", total);
+        if (total <= 5) {
+            if (exact)
+                LogLine("SPIRV: replacement ACCEPTED (exact hash, not structure) - this module is byte-identical to a file in spv_replace (%ld accepted so far)",
+                    total);
+            else
+                LogLine("SPIRV: replacement ACCEPTED (%s) - STRUCTURAL matching is in use on this GPU (%ld accepted so far)",
+                    how ? how : "?", total);
+        }
     }
 
     // One line at shutdown: whether the folder was actually used, or only matched in the
     // self-test. Without it a log that ends after "SELFTEST PASSED" is ambiguous.
     void LogReplacementSummary() {
         const long hitExact = g_replHitsExact, hitSim = g_replHitsSimilar, miss = g_replMisses;
+        const long noCand = g_replMissNoCandidate, rejected = g_replMissRejected;
         if (hitExact + hitSim + miss == 0)
             LogLine("SPIRV SUMMARY: no shader went through the replacement lookup (self-test only, or the game never created a module)");
+        else if (rejected == 0 && hitSim == 0)
+            LogLine("SPIRV SUMMARY: %ld accepted (exact hash), %ld rejected, %ld shader(s) have no counterpart in spv_replace at all - expected: the folder holds a few files and the game compiles hundreds. Nothing is wrong here.",
+                hitExact, rejected, noCand);
         else if (hitSim > 0)
             LogLine("SPIRV SUMMARY: PORTABLE PATH USED - %ld replacement(s) accepted by structure (%ld by exact hash, %ld rejected). This is what another GPU sees.",
                 hitSim, hitExact, miss);
+        else if (hitExact > 0 && rejected > 0)
+            LogLine("SPIRV SUMMARY: %ld accepted by exact hash, but %ld lookup(s) had a CLOSE candidate that was rejected and %ld had no counterpart - the thresholds need work, attach the log",
+                hitExact, rejected, noCand);
         else if (hitExact > 0)
-            LogLine("SPIRV SUMMARY: %ld replacement(s) accepted by exact hash only (%ld rejected) - structure matching was not needed on this GPU",
-                hitExact, miss);
+            LogLine("SPIRV SUMMARY: %ld replacement(s) accepted by exact hash only, none rejected",
+                hitExact);
         else
             LogLine("SPIRV SUMMARY: NOTHING ACCEPTED - %ld lookup(s) found no replacement; see the 'no replacement for hash=' lines above", miss);
     }

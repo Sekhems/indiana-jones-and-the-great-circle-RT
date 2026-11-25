@@ -1305,6 +1305,10 @@ static const SpvOpDesc kSpvOps[] = {
     SRWLOCK g_replIndexLock = SRWLOCK_INIT;
     volatile LONG g_replIndexState = 0;
     volatile LONG g_replHitsExact = 0, g_replHitsSimilar = 0, g_replMisses = 0;
+    // Why a lookup missed: no module of this stage is even close (expected - the folder
+    // holds a handful of files, the game compiles hundreds), or a plausible candidate
+    // was rejected by the thresholds (actionable).
+    volatile LONG g_replMissNoCandidate = 0, g_replMissRejected = 0;
 
     void AddToIndex(std::unordered_map<std::string, std::wstring>& m,
                     std::unordered_set<std::string>& ambiguous,
