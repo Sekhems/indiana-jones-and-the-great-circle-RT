@@ -43,6 +43,12 @@ Intel этот же файл тоже будет принят.
    **«Выполнить с помощью PowerShell»**. Ждём `Built: ...vulkan-1.dll`.
    (Если PowerShell ругается на политику запуска:
    `powershell -ExecutionPolicy Bypass -File .\build_proxy.ps1`.)
+
+   Перед `cl.exe` скрипт сам запускает маленькую проверку
+   `tools\check_namespace_scope.py` и печатает
+   `OK: every spvrw symbol used outside the namespace is qualified or forwarded`.
+   Если вместо этого `FAIL` — пришли эти строки, там будет точный номер
+   строки в `dllmain.cpp` и имя символа (это дешевле, чем полная сборка).
 2. Проверь в `VulkanProxy.ini` эти строки — должно быть ровно так:
 
    ```
