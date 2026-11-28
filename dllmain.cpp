@@ -142,12 +142,12 @@ namespace {
     // be tied to a version and a fixed bug was reported over and over.
     // Bump this on every behaviour change; the date/time comes from
     // the compiler so it is always the real build, not something to remember.
-    constexpr const char* kProxyVersion = "v22";
+    constexpr const char* kProxyVersion = "v23";
     // What changed in this build, printed once so a reader does not have to guess
     // whether a fix is present: RT is all-or-nothing, denied modules are replaced
     // by neutral ones, memory failures explain themselves, replacement counts are
     // applied-not-found.
-    constexpr const char* kProxyBuildNotes = "dump names carry the module number once | report reads both schemes";
+    constexpr const char* kProxyBuildNotes = "ray misses report a hit at infinity instead of zero (lighting path, not black) | offline test: tools/spv_rq_test.py";
 
     // A5: set by the device probe (below) and read by the acceleration-structure
     // bookkeeping, which is defined much later in the file. DEFINED here, not declared
@@ -4687,6 +4687,62 @@ inline bool LowerFp16Alu(const uint32_t* in, size_t n, std::vector<uint32_t>& ou
         return true;
     }
 
+    // -----------------------------------------------------------------------
+    // Option 2: give the ray a meaningful miss instead of "nothing at all".
+    //
+    // The old rewrite replaced every ray-query result with a null constant, so a
+    // lighting shader computed light from "no hit" and multiplied by zero. That is
+    // why a zone that has skylight in the sky map turned black.
+    //
+    // Tracing real geometry is impossible here: the game never builds an
+    // acceleration structure (proved by the SOFTWARE RT measurement), so the proxy
+    // is never handed a single triangle. What it CAN do is answer the ray with
+    // "hit at infinity": the intersection is reported as existing, at a fixed far
+    // distance along the ray direction, with a neutral surface. Shaders that use
+    // hit distance or skip lighting on a miss now take the lit path, and the
+    // distance falloff gives a soft ambient look instead of a black hole.
+    //
+    // Values are deliberately conservative: far away (so anything distance-driven
+    // fades to the ambient term), a unit normal pointing back along the ray (so a
+    // dot product against the ray does not go negative), and small barycentrics
+    // that keep texture-coordinate maths finite.
+    // -----------------------------------------------------------------------
+    struct RayMissReply {
+        float distance;   // reported hit distance (metres, roughly)
+        float normal[3];  // world-space normal of the imaginary surface
+        float bary[2];    // barycentric coordinates inside the imagined triangle
+    };
+    inline RayMissReply MakeRayMissReplyFallback() {
+        RayMissReply r{};
+        r.distance = 1000.0f;
+        r.normal[0] = 0.0f; r.normal[1] = 0.0f; r.normal[2] = 1.0f;
+        r.bary[0] = 0.333333f; r.bary[1] = 0.333333f;
+        return r;
+    }
+
+    // The types a replacement constant may need, collected in one pass so a value can
+    // be built from an id alone: its scalar widths, its vector shape, whether it is a
+    // bool. SPIR-V constants are plain words, so the builder below writes them directly.
+    struct RqTypeTable {
+        // type id -> what it is
+        std::unordered_map<uint32_t, uint32_t> intWidth;      // OpTypeInt: width
+        std::unordered_map<uint32_t, uint32_t> intSigned;     // OpTypeInt: signedness
+        std::unordered_map<uint32_t, uint32_t> floatWidth;    // OpTypeFloat: width
+        std::unordered_map<uint32_t, uint32_t> vecOf;         // OpTypeVector: component type
+        std::unordered_map<uint32_t, uint32_t> vecCount;      // OpTypeVector: component count
+        std::unordered_map<uint32_t, bool> isPointerTo;       // OpTypePointer -> already a pointer
+        std::unordered_set<uint32_t> boolTypes;               // OpTypeBool
+    };
+
+    // True when the type is an integer, float or bool scalar/vector we can build a
+    // constant for. Bools count: OpRayQueryGetIntersectionFrontFace returns one.
+    inline bool IsNumericValue(const RqTypeTable& tt, uint32_t typeId) {
+        if (tt.intWidth.count(typeId) || tt.floatWidth.count(typeId) || tt.boolTypes.count(typeId)) return true;
+        auto v = tt.vecOf.find(typeId);
+        if (v != tt.vecOf.end()) return IsNumericValue(tt, v->second);
+        return false;
+    }
+
 inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& out, std::string& err) {
         if (!in || n < 5 || in[0] != 0x07230203u) { err = "not spir-v"; return false; }
         std::vector<Inst> insts;
@@ -4721,16 +4777,179 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         }
         if (!any) { err = "no ray query"; return false; }
 
-        // ---- pass 2: which result types need a null constant for replaced instructions
+        // ---- pass 2: what each replaced ray-query instruction must return
+        //
+        // Option 2 ("hit at infinity") needs DIFFERENT values per instruction, not one
+        // null constant: a distance, a normal, barycentrics, an instance id. So the
+        // replacement is chosen per opcode instead of per result type.
         uint32_t bound = in[3];
-        std::unordered_map<uint32_t, uint32_t> nullFor;     // type id -> new constant id
-        std::vector<uint32_t> nullOrder;
+        RqTypeTable tt;
         for (const Inst& I : insts) {
-            if (!IsRqValueOp(I.op)) continue;
             const uint32_t* w = in + I.off;
-            if (I.wc < 4) { err = "short rq op"; return false; }
-            if (removedTypes.count(w[1])) { err = "rq op returns removed type"; return false; }
-            if (!nullFor.count(w[1])) { nullFor[w[1]] = bound++; nullOrder.push_back(w[1]); }
+            if (I.op == 21 && I.wc >= 4) { tt.intWidth[w[1]] = w[2]; tt.intSigned[w[1]] = w[3]; }
+            else if (I.op == 22 && I.wc >= 3) tt.floatWidth[w[1]] = w[2];
+            else if (I.op == 23 && I.wc >= 4) { tt.vecOf[w[1]] = w[2]; tt.vecCount[w[1]] = w[3]; }
+            else if (I.op == 20 && I.wc >= 2) tt.boolTypes.insert(w[1]);
+        }
+        // The replacement constants are collected here and emitted just before the first
+        // OpFunction, which is also where SPIR-V requires them: module scope, after the
+        // types and before any function body. A constant instruction placed inside a
+        // function is invalid, so every value the rewrite invents has to be module scope.
+        // Insertion order is emission order, and a composite is only created after its
+        // components, so nothing is used before it is declared.
+        //
+        // The "no hit" rule is kept for the ops whose value only has meaning when a real
+        // intersection exists (instance/geometry/primitive ids): a hit at infinity has no
+        // instance, so answering "0" there is the honest reply, not a leftover.
+        std::vector<uint32_t> constEmit;
+        auto emitTypedConstant = [&](const std::vector<uint32_t>& words) {
+            constEmit.insert(constEmit.end(), words.begin(), words.end());
+        };
+        // type<<32|kind -> the id of a module-scope constant that holds that value
+        std::unordered_map<uint64_t, uint32_t> constCache;
+        // One OpConstant for a scalar type, returning its result id.
+        auto emitScalarConst = [&](uint32_t ty, int kind, uint32_t& idOut) -> bool {
+            const RayMissReply reply = MakeRayMissReplyFallback();
+            idOut = 0;
+            auto fi = tt.floatWidth.find(ty);
+            if (fi != tt.floatWidth.end()) {
+                if (fi->second != 32) return false;   // 64-bit floats are not used by these shaders
+                float v = 0.0f;
+                switch (kind) {
+                case 1: v = reply.distance; break;                 // a miss that is "far away"
+                case 2: v = reply.normal[2]; break;                // normal pointing at the viewer
+                case 3: v = reply.bary[0]; break;                  // barycentrics at the centre
+                case 4: v = 1.0f; break;                           // "yes", "hit", "front face"
+                default: v = 0.0f; break;
+                }
+                uint32_t bits = 0; memcpy(&bits, &v, 4);
+                idOut = bound++;
+                std::vector<uint32_t> w;
+                w.push_back((4u << 16) | 43u);   // OpConstant, one literal word
+                w.push_back(ty); w.push_back(idOut); w.push_back(bits);
+                emitTypedConstant(w);
+                return true;
+            }
+            auto ii = tt.intWidth.find(ty);
+            if (ii != tt.intWidth.end()) {
+                if (ii->second != 32) return false;
+                int32_t v = 0;
+                switch (kind) {
+                case 1: v = static_cast<int32_t>(reply.distance); break;
+                case 2: v = static_cast<int32_t>(reply.normal[2]); break;
+                case 3: v = 0; break;   // a third does not survive as an integer
+                case 4: v = 1; break;
+                default: v = 0; break;
+                }
+                idOut = bound++;
+                std::vector<uint32_t> w;
+                w.push_back((4u << 16) | 43u);
+                w.push_back(ty); w.push_back(idOut); w.push_back(static_cast<uint32_t>(v));
+                emitTypedConstant(w);
+                return true;
+            }
+            auto bi = tt.boolTypes.find(ty);
+            if (bi != tt.boolTypes.end()) {
+                // A boolean constant is OpConstantTrue / OpConstantFalse.
+                idOut = bound++;
+                std::vector<uint32_t> w;
+                w.push_back((3u << 16) | ((kind == 4) ? 41u : 42u));   // OpConstantTrue / OpConstantFalse
+                w.push_back(ty); w.push_back(idOut);
+                emitTypedConstant(w);
+                return true;
+            }
+            return false;
+        };
+        auto constFor = [&](uint32_t typeId, int kind) -> uint32_t {
+            // kind: 0 = zero, 1 = miss distance, 2 = normal z, 3 = one third, 4 = one
+            if (!IsNumericValue(tt, typeId)) return 0;
+            const uint64_t key = (static_cast<uint64_t>(typeId) << 32) | static_cast<uint32_t>(kind);
+            auto it = constCache.find(key);
+            if (it != constCache.end()) return it->second;
+            std::vector<uint32_t> w;
+            uint32_t id = 0;
+            if (emitScalarConst(typeId, kind, id)) { constCache[key] = id; return id; }
+            auto v = tt.vecOf.find(typeId);
+            if (v == tt.vecOf.end()) return 0;
+            const uint32_t compTy = v->second, count = tt.vecCount[typeId];
+            std::vector<uint32_t> comps;
+            for (uint32_t c = 0; c < count; ++c) {
+                uint32_t cid = 0;
+                if (!emitScalarConst(compTy, kind, cid)) return 0;
+                comps.push_back(cid);
+            }
+            id = bound++;
+            w.push_back(((3u + count) << 16) | 44u);   // OpConstantComposite
+            w.push_back(typeId); w.push_back(id);
+            for (uint32_t c : comps) w.push_back(c);
+            emitTypedConstant(w);
+            constCache[key] = id;
+            return id;
+        };
+        // Which kind of value an opcode needs, from the KHR ray query opcodes as the
+        // Khronos headers define them. Getting these numbers wrong is silent: the module
+        // still compiles, it just returns nonsense. So, spelled out:
+        //   4477 OpRayQueryProceedKHR                 -> bool, "another candidate?"
+        //   4479 OpRayQueryGetIntersectionTypeKHR     -> int, 1 = triangle
+        //   6016 GetRayTMin            6017 GetRayFlags
+        //   6018 GetIntersectionT      <- the hit distance
+        //   6019 InstanceCustomIndex   6020 InstanceId      6021 SBTRecordOffset
+        //   6022 GeometryIndex         6023 PrimitiveIndex
+        //   6024 Barycentrics          6025 FrontFace       6026 CandidateAABBOpaque
+        //   6027/6028 object ray dir/origin   6029/6030 world ray dir/origin
+        //   6031/6032 object<->world matrices
+        auto kindForOp = [](uint32_t op) -> int {
+            switch (op) {
+            // 0 = zero, 1 = the far hit distance, 2 = normal z, 3 = one third, 4 = one
+            case 4477: return 0;   // Proceed: NO more candidates. Must stay false, or the
+                                   // shader's traversal loop never ends.
+            case 4479: return 4;   // IntersectionType = triangle (1), i.e. a real hit
+            case 6018: return 1;   // IntersectionT = the far distance
+            case 6024: return 3;   // Barycentrics = (1/3, 1/3)
+            case 6025: return 4;   // FrontFace = true
+            case 6019: case 6020: case 6021: case 6022: case 6023: return 0;
+            case 6016: case 6017: return 0;
+            case 6026: return 4;   // CandidateAABBOpaque = true: the "candidate" is solid
+            // The ray itself. A hit at infinity is reported at a fixed distance, so the
+            // direction and origin the shader would use to reconstruct the hit point are
+            // not ours to invent; zero keeps the arithmetic finite and well typed.
+            case 6027: case 6028: case 6029: case 6030: return 0;
+            case 6031: case 6032: return 0;   // matrices: no constant, falls back to OpUndef
+            default: return 0;
+            }
+        };
+
+        // ---- pass 2b: choose the replacement value of every ray-query instruction
+        //
+        // This has to happen BEFORE the first byte of output is written, for one hard
+        // reason: SPIR-V constants are module scope, and the proxy emits them just before
+        // the first OpFunction. Choosing a value lazily while walking the function bodies
+        // would discover them after that point - the constants would then be missing from
+        // the module and every reference to them would be dangling.
+        // Keyed by the instruction's own result id, which is what the shader already uses.
+        std::unordered_map<uint32_t, uint32_t> replValue;
+        for (const Inst& I : insts) {
+            const uint32_t* w = in + I.off;
+            if (!IsRqValueOp(I.op) || I.wc < 3) continue;
+            const uint32_t resultType = w[1], resultId = w[2];
+            uint32_t cv = constFor(resultType, kindForOp(I.op));
+            if (!cv) {
+                // A type no constant can be built for (a matrix, say). OpConstantNull is
+                // legal for any type made of scalars, vectors, matrices and arrays, and it
+                // is what the old rewrite used, so nothing can regress by falling back.
+                const uint64_t key = (static_cast<uint64_t>(resultType) << 32) | 0u;
+                auto it = constCache.find(key);
+                if (it != constCache.end()) cv = it->second;
+                else {
+                    cv = bound++;
+                    std::vector<uint32_t> nw;
+                    nw.push_back((3u << 16) | 46u);   // OpConstantNull
+                    nw.push_back(resultType); nw.push_back(cv);
+                    emitTypedConstant(nw);
+                    constCache[key] = cv;
+                }
+            }
+            replValue[resultId] = cv;
         }
 
         // ---- pass 3: emit
@@ -4738,10 +4957,14 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         out.reserve(n);
         out.insert(out.end(), in, in + 5);
         bool constsEmitted = false;
+        // The constants are emitted ONE INSTRUCTION BEFORE the first OpFunction, in the
+        // order they were created: every id a constant refers to (component types and
+        // component constants) is emitted before the instruction that uses it, which is
+        // what SPIR-V's "dominates" rule for types and constants requires.
         auto emitConsts = [&]() {
             if (constsEmitted) return;
             constsEmitted = true;
-            for (uint32_t t : nullOrder) { out.push_back((3u << 16) | 46u); out.push_back(t); out.push_back(nullFor[t]); }
+            out.insert(out.end(), constEmit.begin(), constEmit.end());
         };
         auto isRemoved = [&](uint32_t id) { return removedTypes.count(id) || removedValues.count(id); };
 
@@ -4762,8 +4985,14 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
             if (op == 59 && I.wc >= 3 && removedValues.count(w[2])) continue;
             if (IsRqVoidOp(op)) continue;
             if (IsRqValueOp(op)) {
-                out.push_back((4u << 16) | 83u);           // OpCopyObject
-                out.push_back(w[1]); out.push_back(w[2]); out.push_back(nullFor[w[1]]);
+                // Option 2: answer with a typed value that describes a hit at infinity.
+                // The value was chosen in pass 2 (see replValue); this pass only writes it.
+                const uint32_t cv = replValue[w[2]];
+                if (!cv) continue;                               // no replacement known
+                // The instruction's own result id is kept as the id the rest of the shader
+                // already refers to; the value comes from the module-scope constant.
+                out.push_back((4u << 16) | 83u);                 // OpCopyObject
+                out.push_back(w[1]); out.push_back(w[2]); out.push_back(cv);
                 continue;
             }
             {
