@@ -142,12 +142,12 @@ namespace {
     // be tied to a version and a fixed bug was reported over and over.
     // Bump this on every behaviour change; the date/time comes from
     // the compiler so it is always the real build, not something to remember.
-    constexpr const char* kProxyVersion = "v19";
+    constexpr const char* kProxyVersion = "v20";
     // What changed in this build, printed once so a reader does not have to guess
     // whether a fix is present: RT is all-or-nothing, denied modules are replaced
     // by neutral ones, memory failures explain themselves, replacement counts are
     // applied-not-found.
-    constexpr const char* kProxyBuildNotes = "report after first frame | quiet trace | honest counts | AS/geometry evidence for SoftwareRT";
+    constexpr const char* kProxyBuildNotes = "correct stage counts | SoftwareRT verdict from real AS calls";
 
     // A5: set by the device probe (below) and read by the acceleration-structure
     // bookkeeping, which is defined much later in the file. DEFINED here, not declared
@@ -2219,6 +2219,8 @@ namespace {
         if (g_asStats.asCreated == 0 && builds == 0 && g_asStats.traceRays == 0) {
             LogLine("SOFTWARE RT: the game never created or built an acceleration structure and never traced rays - "
                 "there is no geometry to trace here, so software ray tracing cannot change the picture");
+            LogLine("SOFTWARE RT: translation: the darkness comes from the ray-query shaders whose 'no hit' result the lighting "
+                "is multiplied by. Replacing those shaders is the only lever left on this adapter.");
             return;
         }
         LogLine("SOFTWARE RT: AS built %ld time(s) (%ld indirect), %ld geometr(ies), ~%ld vertices; vertex data addressable: %s",
@@ -5735,9 +5737,15 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         long& vSeen, long& vHit, long& fSeen, long& fHit, long& cSeen, long& cHit) {
         compiled = g_spvModulesSeen;
         replaced = g_replAppliedExact + g_replAppliedSimilar;
+        // StageBucket() is fed si.model - the SPIR-V *ExecutionModel*, not the Vulkan
+        // stage bit: 0 vertex, 1 tess-control, 2 tess-eval, 3 geometry, 4 fragment,
+        // 5 compute, 5267 task, 5268 mesh. Reading buckets 0/1/2 here therefore printed
+        // tess-control/tess-eval counts under the labels vertex/fragment/compute, and a
+        // real v19 log showed "vertex 371 | fragment 0 | compute 0" while 189 ray-query
+        // modules had been rewritten - arithmetic that cannot be true.
         vSeen = g_stageSeen[0]; vHit = g_stageHit[0];
-        fSeen = g_stageSeen[1]; fHit = g_stageHit[1];
-        cSeen = g_stageSeen[2]; cHit = g_stageHit[2];
+        fSeen = g_stageSeen[4]; fHit = g_stageHit[4];
+        cSeen = g_stageSeen[5]; cHit = g_stageHit[5];
     }
 
     // One line at shutdown: whether the folder was actually used, or only matched in the
