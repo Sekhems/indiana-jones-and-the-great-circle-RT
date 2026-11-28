@@ -150,6 +150,23 @@ static bool ConstValue(const std::vector<uint32_t>& w, uint32_t id, uint32_t& va
     return false;
 }
 
+// Component values of a constant composite, in order.
+static bool CompositeValues(const std::vector<uint32_t>& w, uint32_t id, std::vector<uint32_t>& vals) {
+    for (size_t i = 5; i < w.size();) {
+        const uint32_t wc = w[i] >> 16, op = w[i] & 0xFFFF;
+        if (op == 44 && wc >= 3 && w[i + 2] == id) {
+            for (uint32_t k = 3; k < wc; ++k) {
+                uint32_t v = 0, t = 0;
+                if (!ConstValue(w, w[i + k], v, t)) return false;
+                vals.push_back(v);
+            }
+            return true;
+        }
+        i += wc;
+    }
+    return false;
+}
+
 // Result of "OpCopyObject %type %id %source": what value does %id get?
 static uint32_t CopySource(const std::vector<uint32_t>& w, uint32_t id) {
     for (size_t i = 5; i < w.size();) {
@@ -220,7 +237,8 @@ int main(int argc, char** argv) {
         char line[128];
         while (fgets(line, sizeof(line), f)) {
             unsigned long long id = 0; unsigned long long val = 0; char kind[32] = {0};
-            if (sscanf(line, "%llu %llu %31s", &id, &val, kind) != 3) continue;
+            int used = 0;
+            if (sscanf(line, "%llu %llu %31s %n", &id, &val, kind, &used) != 3) continue;
             if (!strcmp(kind, "float")) {
                 Expect(HasValue(out, (uint32_t)id, (uint32_t)val, 0), "float constant has the expected value");
             } else if (!strcmp(kind, "int")) {
@@ -228,6 +246,26 @@ int main(int argc, char** argv) {
             } else if (!strcmp(kind, "booltrue")) {
                 const uint32_t src = CopySource(out, (uint32_t)id);
                 Expect(src && HasValue(out, (uint32_t)id, 1, 0), "boolean constant is true");
+            } else if (!strcmp(kind, "composite")) {
+                // "<id> composite <comp0> <comp1> <comp2>": the components must be
+                // exactly the ones the shader stated in its ray initialiser. This is
+                // the check that catches "direction answered with zero".
+                unsigned tmp[8] = {0};
+                int got = 0;
+                int pos = used;
+                while (got < 8) {
+                    int step = 0;
+                    unsigned v = 0;
+                    if (sscanf(line + pos, " %u %n", &v, &step) != 1) break;
+                    tmp[got++] = v;
+                    pos += step;
+                }
+                const uint32_t src = CopySource(out, (uint32_t)id);
+                std::vector<uint32_t> comps;
+                bool okv = src && CompositeValues(out, src, comps) && got > 0 &&
+                           (int)comps.size() == got;
+                if (okv) for (int k = 0; k < got; ++k) if (comps[k] != tmp[k]) okv = false;
+                Expect(okv, "composite carries the ray's own components");
             } else if (!strcmp(kind, "boolfalse")) {
                 Expect(HasValue(out, (uint32_t)id, 0, 0), "boolean constant is false");
             }
@@ -334,6 +372,54 @@ def fixture_textured():
     return a.words(), want
 
 
+def fixture_ray_direction():
+    """A read of the ray's own direction must be the direction the shader stated in
+    OpRayQueryInitializeKHR, not zero.
+
+    This is the bug that survived v23: directions were answered with 0, so every
+    direction-dependent lighting term sampled nothing and a zone stayed black even
+    though the rewrite reported success. A test that only checks "no ray opcode
+    survives" cannot see it, because a zero is a perfectly valid constant.
+    """
+    a = Asm()
+    f32, v3, u32t, boolt = a.id(), a.id(), a.id(), a.id()
+    voidty, fnty, rqty = a.id(), a.id(), a.id()
+    fnid, label, var_rq = a.id(), a.id(), a.id()
+    # The ray: direction (0.7, 0.0, -0.7) stated by the shader itself.
+    d0, d1, d2 = a.id(), a.id(), a.id()
+    zero, tmax = a.id(), a.id()
+    out_dir = a.id()
+
+    H = a.head
+    a.inst(H, 17, [4472])
+    a.inst(H, 14, [0, 1, 1, 1])
+    a.inst(H, 15, [5, fnid, 0x6E69616D, 0])
+    a.inst(H, 19, [voidty])
+    a.inst(H, 20, [boolt])
+    a.inst(H, 22, [f32, 32])
+    a.inst(H, 21, [u32t, 32, 0])
+    a.inst(H, 23, [v3, f32, 3])
+    a.inst(H, 4472, [rqty])
+    a.inst(H, 33, [fnty, voidty])
+    a.inst(H, 43, [f32, zero, 0])
+    a.inst(H, 43, [f32, d0, 0x3F333333])      # 0.7
+    a.inst(H, 43, [f32, d1, 0x00000000])      # 0.0
+    a.inst(H, 43, [f32, d2, 0xBF333333])      # -0.7
+    a.inst(H, 43, [f32, tmax, 0x447A0000])
+
+    B = a.body
+    a.inst(B, 54, [voidty, fnid, 0, fnty])
+    a.inst(B, 248, [label])
+    a.inst(B, 59, [rqty, var_rq, 7])
+    # origin (0,0,0) tMin 0 direction (d0,d1,d2) tMax 1000
+    a.inst(B, 4473, [var_rq, zero, zero, zero, zero, d0, d1, d2, tmax])
+    a.inst(B, 6029, [v3, out_dir, var_rq])     # OpRayQueryGetWorldRayDirectionKHR
+    a.inst(B, 253, [])
+    a.inst(B, 56, [])
+    # 0.7, 0.0, -0.7 as bit patterns, exactly what the initialiser named.
+    return a.words(), [(out_dir, 0, 'composite %d %d %d' % (0x3F333333, 0x00000000, 0xBF333333))]
+
+
 def fixture_unsupported():
     """Types a constant cannot be built for, plus the matrices: the rewrite must
     still leave a module whose ids all resolve."""
@@ -399,6 +485,7 @@ def main():
 
         failures = 0
         for name, builder in (('traversal loop', fixture_textured),
+                              ('ray direction', fixture_ray_direction),
                               ('types without a constant', fixture_unsupported)):
             words, want = builder()
             mod = tmp / (name.replace(' ', '_') + '.spv')

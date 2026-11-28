@@ -142,12 +142,12 @@ namespace {
     // be tied to a version and a fixed bug was reported over and over.
     // Bump this on every behaviour change; the date/time comes from
     // the compiler so it is always the real build, not something to remember.
-    constexpr const char* kProxyVersion = "v23";
+    constexpr const char* kProxyVersion = "v24";
     // What changed in this build, printed once so a reader does not have to guess
     // whether a fix is present: RT is all-or-nothing, denied modules are replaced
     // by neutral ones, memory failures explain themselves, replacement counts are
     // applied-not-found.
-    constexpr const char* kProxyBuildNotes = "ray misses report a hit at infinity instead of zero (lighting path, not black) | offline test: tools/spv_rq_test.py";
+    constexpr const char* kProxyBuildNotes = "ray reads keep the ray's OWN direction/origin; v23 answered them with zero, which blackens sky and ambient | test: tools/spv_rq_test.py";
 
     // A5: set by the device probe (below) and read by the acceleration-structure
     // bookkeeping, which is defined much later in the file. DEFINED here, not declared
@@ -2421,6 +2421,13 @@ namespace {
         if (g_spvCfg.dumpLookupInput != 0)
             LogLine("SPIRV: DumpLookupInput=%d - dumping modules next to this log (0 = off, -1 = every module)",
                 g_spvCfg.dumpLookupInput);
+        // What a rewritten ray now answers. Every summary counted a rewritten module the
+        // same way in v21, v23 and v24, so without this line a screenshot cannot be tied
+        // to a build - and v23's zeroed directions were invisible for exactly that reason.
+        if (g_spvCfg.rewriteRayQuery)
+            LogLine("SPIRV: ray reads answer T=%.0f, type=triangle, bary=1/3, front=true, proceed=false; direction/origin are the shader's own (%s)",
+                spvrw::MakeRayMissReplyFallback().distance,
+                g_spvCfg.brightness != 1.0f ? "post-process gain is on" : "no post-process gain");
     }
 
     // Blocking, thread-safe: other threads must WAIT for the ini to be read, otherwise shaders created at the
@@ -4928,10 +4935,56 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         // the module and every reference to them would be dangling.
         // Keyed by the instruction's own result id, which is what the shader already uses.
         std::unordered_map<uint32_t, uint32_t> replValue;
+        // A read of the ray's direction/origin is the ONE case where the answer is not
+        // invented: the shader itself stated the ray in OpRayQueryInitializeKHR, whose
+        // operands are still in this module. Zeroing those reads (which is what earlier
+        // builds did) makes every direction-dependent term - sky colour, ambient, the
+        // hemispherical fallback - sample nothing, i.e. black. Forwarding the real value
+        // costs nothing and keeps the lighting maths meaningful.
+        //   OpRayQueryInitializeKHR: rayQuery origin[1..3] tMin[4] direction[5..7] tMax[8]
+        // The value is ALSO emitted early, because the instruction it comes from is
+        // before the first OpFunction, so it cannot be referenced from the late consts.
+        // Component ids of the last initialiser, used when a read asks for the ray
+        // direction/origin and the type is a float3 of the same width. A module with
+        // several ray queries is not handled specially: the first one wins, which is
+        // right for the single-ray-per-invocation pattern these shaders use.
+        std::vector<uint32_t> rayDirComp, rayOrgComp;
+        for (const Inst& I : insts) {
+            const uint32_t* w = in + I.off;
+            if (I.op == 4473 && I.wc >= 9) {
+                rayOrgComp = { w[2], w[3], w[4] };
+                rayDirComp = { w[6], w[7], w[8] };
+                break;
+            }
+        }
         for (const Inst& I : insts) {
             const uint32_t* w = in + I.off;
             if (!IsRqValueOp(I.op) || I.wc < 3) continue;
             const uint32_t resultType = w[1], resultId = w[2];
+            // 6027 object-space ray direction, 6029 world-space ray direction,
+            // 6028 object-space origin,       6030 world-space origin.
+            const std::vector<uint32_t>* comps = nullptr;
+            if (I.op == 6027 || I.op == 6029) comps = &rayDirComp;
+            else if (I.op == 6028 || I.op == 6030) comps = &rayOrgComp;
+            if (comps && comps->size() == 3) {
+                auto v = tt.vecOf.find(resultType);
+                if (v != tt.vecOf.end() && tt.vecCount[resultType] == 3 &&
+                    tt.floatWidth.count(v->second) && tt.floatWidth[v->second] == 32) {
+                    const uint64_t key = (static_cast<uint64_t>(resultType) << 32) | 0x1000u;
+                    auto it = constCache.find(key);
+                    if (it != constCache.end()) { replValue[resultId] = it->second; continue; }
+                    // Reuse the module's own scalar ids: no new constants, no new values,
+                    // just the composite that names them.
+                    const uint32_t cv = bound++;
+                    constEmit.push_back((6u << 16) | 44u);      // OpConstantComposite %v3f
+                    constEmit.push_back(resultType); constEmit.push_back(cv);
+                    constEmit.push_back((*comps)[0]); constEmit.push_back((*comps)[1]);
+                    constEmit.push_back((*comps)[2]);
+                    constCache[key] = cv;
+                    replValue[resultId] = cv;
+                    continue;
+                }
+            }
             uint32_t cv = constFor(resultType, kindForOp(I.op));
             if (!cv) {
                 // A type no constant can be built for (a matrix, say). OpConstantNull is
