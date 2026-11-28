@@ -227,6 +227,9 @@ def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description="Rank dumped shaders by how likely they are to be where the light is lost.")
     ap.add_argument("paths", nargs="+", type=Path, help="game folder (contains spv_input_*.spv) or the files themselves")
     ap.add_argument("--top", type=int, default=15, help="how many candidates to print in detail (default 15)")
+    ap.add_argument("--all", action="store_true",
+                    help="also list modules with no evidence (useful after DumpLookupInput=-1, "
+                         "which dumps every module: this is the full inventory of the shader set)")
     ap.add_argument("--json", type=Path, help="write the full table as JSON to this file")
     args = ap.parse_args(argv)
 
@@ -266,6 +269,17 @@ def main(argv: list[str]) -> int:
         print(f"Modules that are ray-tracing stages (withheld completely): {len(stages)}")
 
     ranked = sorted(good, key=lambda m: m.score, reverse=True)
+    if not args.all:
+        # After DumpLookupInput=-1 every module is dumped, so the list has to be readable:
+        # keep the ones with any evidence and say how many were hidden.
+        with_evidence = [m for m in ranked if m.score[0] or m.score[1]]
+        hidden = len(ranked) - len(with_evidence)
+        if with_evidence:
+            ranked = with_evidence
+        else:
+            hidden = 0
+        if hidden:
+            print(f"({hidden} module(s) with no ray/light evidence are hidden - add --all to list them)")
     print()
     print("Candidates, best evidence first")
     print(f"{'#':>3}  {'stage':<12} {'rays':>5} {'smp':>4} {'light-names':>11}  {'hash':<16} verdict")

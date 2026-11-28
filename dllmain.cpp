@@ -142,12 +142,12 @@ namespace {
     // be tied to a version and a fixed bug was reported over and over.
     // Bump this on every behaviour change; the date/time comes from
     // the compiler so it is always the real build, not something to remember.
-    constexpr const char* kProxyVersion = "v17";
+    constexpr const char* kProxyVersion = "v18";
     // What changed in this build, printed once so a reader does not have to guess
     // whether a fix is present: RT is all-or-nothing, denied modules are replaced
     // by neutral ones, memory failures explain themselves, replacement counts are
     // applied-not-found.
-    constexpr const char* kProxyBuildNotes = "RT all-or-nothing | neutral module instead of FAKE | MEMORY diagnosis | applied replacement counts";
+    constexpr const char* kProxyBuildNotes = "report printed after first frame too | per-descriptor trace off by default | honest denied/rewritten counts | dump limit announced";
 
     // Version reported to the game when the real driver reports less.
     const uint32_t kSpoofMinApiMajorMinor = VK_MAKE_API_VERSION(0, 1, 3, 0);
@@ -3212,6 +3212,10 @@ static const SpvOpDesc kSpvOps[] = {
 
     struct Inst { uint32_t op, wc; size_t off; };
 
+    // "the instruction produces a value" (as opposed to OpRayQueryInitializeKHR and the
+    // other void ones). Note that 6016..6032 are the ray-query getters, NOT dot products:
+    // dot product PRODUCTS (OpSDot/OpUDot/...) live in a different opcode range, and
+    // capabilities and opcodes share numbers in SPIR-V - mixing them up here is easy.
     inline bool IsRqValueOp(uint32_t op) {
         return op == 4477 || op == 4479 || op == 5340 || (op >= 6016 && op <= 6032);
     }
@@ -5755,6 +5759,10 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     void NoteReplacementApplied(bool exact) { spvrw::NoteReplacementApplied(exact); }
     void NoteModuleStage(uint32_t stage, bool replaced, bool denied) { spvrw::NoteModuleStage(stage, replaced, denied); }
     void LogReplacementSummary() { spvrw::LogReplacementSummary(); }
+    // A4: forwarder - the report is built next to the counters it prints, but the
+    // first-present hook that schedules it lives outside this namespace.
+    void LogExitReportOnceAfterFirstPresent() { spvrw::LogExitReportOnceAfterFirstPresent(); }
+
     // Read-only view of the light counters, so the one-screen summary (which lives in
     // this namespace) can print them without reaching into spvrw's internals.
     void GetLightCounters(long& rqSeen, long& rqRewritten, long& withheld) {
@@ -5803,6 +5811,20 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
             LogLine("PROXY SUMMARY: verdict     : no crash and no replacement; the folder has no module for these shaders or was not used");
         LogLine("PROXY SUMMARY: ---------- end of report ----------");
     }
+    // A4: an honest exit report even when the process never unloads the DLL.
+    //
+    // A real log ended at "vkCreateSwapchainKHR ..." with no DETACH and no summary at
+    // all: the game was closed from the task bar (or crashed) and the one-screen report
+    // never ran. So print the report once, a few seconds after the first present - by
+    // then the world is loaded and the shaders that matter are compiled. It is printed
+    // at most once, so a normal exit still shows exactly one final report at DETACH.
+    void LogExitReportOnceAfterFirstPresent() {
+        static volatile LONG printed = 0;
+        if (InterlockedIncrement(&printed) != 1) return;
+        LogLine("PROXY SUMMARY: (report after the first frame - printed even if the game is then closed from the task bar; a final report follows at unload)");
+        LogProxySummary();
+    }
+
     void RunReplacementSelfTest(int mode) { spvrw::RunReplacementSelfTest(mode); }
 
     // ---- SPIR-V module info ---------------------------------------------------
@@ -6609,7 +6631,33 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
                 (unsigned long long)rec.binds, boundSets.size(), totalResources, rec.caps.c_str());
         }
 
-        if (resourcesChanged) {
+        // B5: one line per dispatch, never one line per descriptor.
+        //
+        // A real v17 log was 22037 lines: 12701 of them were "SPVTRACE ACTIVE_RESOURCE"
+        // (one per bound descriptor, and the same 512 descriptors re-printed for every
+        // dispatch of the same pipeline). That noise hid the lines that matter. The
+        // per-descriptor list is written only for a REPLACEMENT module (where the exact
+        // descriptor is the subject of the investigation) or when Verbose is on; the
+        // counting stays, so "resources=" above is still exact.
+        const bool dumpDescriptorList = rec.replacement || (InterlockedCompareExchange(&g_logVerbose, 0, 0) != 0);
+        if (resourcesChanged && !dumpDescriptorList) {
+            static SRWLOCK digestLock = SRWLOCK_INIT;
+            static uint64_t digestedPipelines[256]{};
+            static LONG digestedCount = 0;
+            bool seen = false, overLimit = false;
+            AcquireSRWLockExclusive(&digestLock);
+            for (LONG i = 0; i < digestedCount; ++i)
+                if (digestedPipelines[i] == (uint64_t)(uintptr_t)pipeline) { seen = true; break; }
+            if (!seen) {
+                if (digestedCount < (LONG)_countof(digestedPipelines)) digestedPipelines[digestedCount++] = (uint64_t)(uintptr_t)pipeline;
+                else overLimit = true;
+            }
+            ReleaseSRWLockExclusive(&digestLock);
+            if (!seen && !overLimit)
+                LogLine("SPVTRACE ACTIVE_BINDING_DIGEST hash=%016llX pipeline=%p sets=%zu resources=%zu (per-descriptor lines only for replacement modules or with Verbose=1)",
+                    (unsigned long long)rec.originalHash, (void*)pipeline, boundSets.size(), totalResources);
+        }
+        if (resourcesChanged && dumpDescriptorList) {
             size_t emitted = 0;
             for (const auto& set : boundSets) {
                 if (rec.replacement)
@@ -6963,15 +7011,28 @@ if (si.rewritten) return std::string();
         static SRWLOCK dumpLock = SRWLOCK_INIT;
         static uint64_t dumpedHashes[16]{};
         static LONG dumpedCount = 0;
-        bool alreadyDumped = false;
+        bool alreadyDumped = false, overLimit = false;
         AcquireSRWLockExclusive(&dumpLock);
         for (LONG i = 0; i < dumpedCount; ++i) {
             if (dumpedHashes[i] == rec.originalHash) { alreadyDumped = true; break; }
         }
-        if (!alreadyDumped && dumpedCount < static_cast<LONG>(_countof(dumpedHashes)))
-            dumpedHashes[dumpedCount++] = rec.originalHash;
+        // This limit used to be silent: the 17th dumped shader was skipped and nothing
+        // said so, while the sibling dump path (DumpSuspiciousComputeShaderForPipeline)
+        // printed "DUMP LIMIT reached". A request to dump 32 shaders therefore looked
+        // half-done for no visible reason.
+        if (!alreadyDumped) {
+            if (dumpedCount < static_cast<LONG>(_countof(dumpedHashes))) dumpedHashes[dumpedCount++] = rec.originalHash;
+            else overLimit = true;
+        }
         ReleaseSRWLockExclusive(&dumpLock);
         if (alreadyDumped) return;
+        if (overLimit) {
+            static volatile LONG limitNotice = 0;
+            if (InterlockedIncrement(&limitNotice) == 1)
+                LogLine("SPVTRACE ACTIVE_COMPUTE_DUMP LIMIT reached (%zu unique modules): raise DumpActiveComputeHashes if more are needed",
+                    _countof(dumpedHashes));
+            return;
+        }
 
         char tag[48]{};
         _snprintf_s(tag, sizeof(tag), _TRUNCATE, "activecmp_%016llX", (unsigned long long)rec.originalHash);
@@ -7796,9 +7857,15 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
         //   spv_input_4_812_74F939DCE4AEB68A.spv
         //     -> stage 4 (fragment), module #812, hash 74F939DCE4AEB68A
         //     -> the replacement must be called spv_74F939DCE4AEB68A.spv
+        // DumpLookupInput = N  -> about N dumps, interesting modules first;
+        // DumpLookupInput = -1 -> EVERY module (a complete inventory of the game's shader
+        //                          set, which is what a hand-made spv_replace folder needs;
+        //                          expect a few hundred MB in the game folder).
         static volatile LONG dumpedInputs = 0;
+        const bool dumpAll = (g_spvCfg.dumpLookupInput < 0);
         const bool interesting = (si.rqOnly || si.rtStage || si.deny || !didReplace);
-        const LONG budget = interesting ? g_spvCfg.dumpLookupInput : (g_spvCfg.dumpLookupInput / 4);
+        const LONG budget = dumpAll ? 0x7FFFFFFFL
+            : (interesting ? g_spvCfg.dumpLookupInput : (g_spvCfg.dumpLookupInput / 4));
         if (budget > 0 && InterlockedIncrement(&dumpedInputs) <= budget) {
             char tag[80];
             _snprintf_s(tag, sizeof(tag), _TRUNCATE, "input_%u_%ld_%016llX", si.model, n,
@@ -7810,7 +7877,12 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
                 didReplace ? ", replaced" : "");
         }
     }
-    if (n % 200 == 0) LogLine("SHADER stats: total=%ld denied=%ld", n, (long)deniedSeen);
+    // "denied" alone was misleading: a real log said "denied=0" while 100 modules had
+    // been rewritten to "no hit", which is a much bigger change to the shader than a
+    // denial. The line now carries both numbers and says what each one means.
+    if (n % 200 == 0)
+        LogLine("SHADER stats: total=%ld denied=%ld ray-query-rewritten=%ld (rewritten = queries turned into 'no hit'; denied = module not given to the driver at all)",
+            n, (long)deniedSeen, (long)(spvrw::g_lightRqRewritten));
     // A ray-tracing STAGE module can never be rewritten into a raster shader: there is
     // nothing to lower it into. Saying so once per run explains the follow-up question
     // ("why were 26 modules replaced by 'nothing'?") without needing anyone to read code.
@@ -8113,6 +8185,20 @@ vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
         LoadSpvConfig();
         LogLine("vkQueuePresentKHR: first present done (result=%d)", (int)r);
         InstallCrashHandlerFirst();
+        // A4: the report must exist even if the game is later killed from the task bar
+        // (a real log ended at the swapchain line with no summary at all). Waiting a few
+        // seconds lets the world finish loading first, so the numbers mean something.
+        {
+            static HANDLE reportThread = nullptr;
+            if (!reportThread) {
+                reportThread = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+                    Sleep(8000);
+                    LogExitReportOnceAfterFirstPresent();
+                    return 0;
+                }, nullptr, 0, nullptr);
+                if (reportThread) CloseHandle(reportThread);
+            }
+        }
         // Old debugging hack, now optional: VulkanProxy.ini [spirv] ExitAfterFirstPresent=1
         wchar_t ip[2048]{};
         GetLogPath(ip, sizeof(ip) / sizeof(ip[0]));
