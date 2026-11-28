@@ -458,9 +458,25 @@ namespace {
         // Uniform RT story: never let the game discover RT hardware (avoids a
         // completely different shader permutation on RTX / Arc / RDNA3).
         if (g_forceVirtualRt) { c.nativeAS = false; c.nativeRTP = false; c.nativeRQ = false; }
-        c.virtualAS = allowFallback && (forceSoftware || !c.nativeAS);
-        c.virtualRTP = allowFallback && (forceSoftware || !c.nativeRTP);
-        c.virtualRQ = allowFallback && (forceSoftware || !c.nativeRQ);
+        // ---- all-or-nothing ray tracing -------------------------------------
+        // A driver either owns the whole ray-tracing feature set or none of it.
+        // Mixing halves is what killed a GTX 1660 Ti run: NVIDIA exposes
+        // VK_KHR_ray_tracing_pipeline but not VK_KHR_ray_query, so the proxy
+        // reported NATIVE ray-tracing stages and a VIRTUAL ray query at the same
+        // time. The game then compiled ray-generation / miss / closest-hit
+        // modules - which no compatible stub can imitate - and the proxy turned
+        // those 26 modules into FAKE handles (20 FAKE pipelines). The next driver
+        // call that touched a pipeline built from them faulted on address
+        // 0xFFFFFFFFFFFFFFFF inside nvoglv64 and the game died with 0xC0000005.
+        // Rule: if any part of RT has to be virtualized on this adapter, then all
+        // of it is virtual, so the game never builds a single ray-tracing module
+        // and never mixes real and fake RT objects.
+        const bool anyVirtualRtWanted = allowFallback &&
+            (forceSoftware || !c.nativeAS || !c.nativeRTP || !c.nativeRQ);
+        if (anyVirtualRtWanted) { c.nativeAS = false; c.nativeRTP = false; c.nativeRQ = false; }
+        c.virtualAS = anyVirtualRtWanted;
+        c.virtualRTP = anyVirtualRtWanted;
+        c.virtualRQ = anyVirtualRtWanted;
         c.virtualDeferred = allowFallback && (forceSoftware || (!c.extDeferred && !c.nativeAS && !c.nativeRTP));
         c.virtualPipelineLibrary = allowFallback && (forceSoftware || (!c.extPipelineLibrary && !c.nativeRTP));
         // Dynamic Rendering is independent of RT mode: keep its existing
@@ -470,6 +486,21 @@ namespace {
         if (forceSoftware || (!c.nativeAS && !c.nativeRTP && !c.nativeRQ)) c.tier = RT_TIER_SOFTWARE;
         else if (c.nativeAS && c.nativeRTP && c.nativeRQ && mode != RT_MODE_SOFTWARE) c.tier = RT_TIER_NATIVE;
         else c.tier = RT_TIER_HYBRID;
+        // Say which story the game was told. "Native RT hardware" and "virtual RT" must
+        // never both be true for the same adapter - that mix is what produced FAKE ray-
+        // tracing modules and a crash in the NVIDIA driver on a GTX 1660 Ti.
+        LogLine("RT POLICY: %s - the game %s",
+            anyVirtualRtWanted ? "ray tracing is VIRTUAL on this adapter (nothing RT reaches the driver)"
+                               : "ray tracing is NATIVE on this adapter (the driver owns it end to end)",
+            anyVirtualRtWanted ? (allowFallback ? "gets the compatibility path, so one spv_replace folder behaves the same everywhere"
+                                               : "gets no ray tracing at all (Mode=native and this driver lacks the feature)")
+                               : "uses its own ray tracing, and the proxy does not touch those modules");
+        // The interesting case is an asymmetric driver: it advertises one half of ray
+        // tracing and not the other (NVIDIA Pascal/Turing: pipeline yes, ray query no).
+        // Print the concrete half, because that is the fact that used to be invisible.
+        if (anyVirtualRtWanted)
+            LogLine("RT POLICY: driver reports ray_tracing_pipeline=%u ray_query=%u; both are virtualized so the game cannot build ray-tracing modules here",
+                c.extRTP ? 1u : 0u, c.extRQ ? 1u : 0u);
 
         // Independent capability probe: ask the driver for the concrete shader
         // features and remember them on the device profile. Shader classification
@@ -844,6 +875,40 @@ namespace {
     }
     template<typename H> bool IsFake(H h) {
         return (static_cast<uint64_t>(reinterpret_cast<uintptr_t>(h)) >> 48) == kFakeTag;
+    }
+
+    // A module the driver is guaranteed to accept when the real one had to be
+    // withheld: a vertex shader that writes gl_Position = (0,0,0,1) and nothing
+    // else. Denying a shader must never end with the driver receiving our 0xFA4E...
+    // handle - that is an immediate 0xC0000005 inside the ICD (proven on a GTX
+    // 1660 Ti: nvoglv64.dll faulted reading 0xFFFFFFFFFFFFFFFF). A draw that uses
+    // this module produces no pixels, which is visible and harmless, instead of
+    // terminating the process.
+    static const uint32_t kNeutralVertexModule[] = {
+        0x07230203u, 0x00010000u, 0x0008000Bu, 0x0000000Du, 0x00000000u, 0x00020011u,
+        0x00000001u, 0x0003000Eu, 0x00000000u, 0x00000001u, 0x0005000Fu, 0x00000000u,
+        0x00000004u, 0x6E69616Du, 0x00000009u, 0x00040047u, 0x00000009u, 0x0000000Bu,
+        0x00000000u, 0x00020013u, 0x00000002u, 0x00030016u, 0x00000006u, 0x00000020u,
+        0x00040017u, 0x00000007u, 0x00000006u, 0x00000004u, 0x00040020u, 0x00000008u,
+        0x00000003u, 0x00000007u, 0x00030021u, 0x00000003u, 0x00000002u, 0x0004002Bu,
+        0x00000006u, 0x0000000Au, 0x00000000u, 0x0004002Bu, 0x00000006u, 0x0000000Bu,
+        0x3F800000u, 0x0004003Bu, 0x00000008u, 0x00000009u, 0x00000003u, 0x00050036u,
+        0x00000002u, 0x00000004u, 0x00000000u, 0x00000003u, 0x000200F8u, 0x00000005u,
+        0x00070050u, 0x00000007u, 0x0000000Cu, 0x0000000Au, 0x0000000Au, 0x0000000Au,
+        0x0000000Bu, 0x0003003Eu, 0x00000009u, 0x0000000Cu, 0x000100FDu, 0x00010038u
+    };
+    inline bool IsNeutralModule(const void* code, size_t bytes) noexcept {
+        return code && bytes == sizeof(kNeutralVertexModule) &&
+            memcmp(code, kNeutralVertexModule, bytes) == 0;
+    }
+
+    // A pipeline stage that references a withheld (FAKE) module must never reach the
+    // driver. Now that denied modules get a real neutral module instead of a FAKE
+    // handle, the remaining FAKE cases are the rare ones (the driver refused even the
+    // neutral module) plus any old code path. Keep the pipeline FAKE in exactly those
+    // cases and say so - see the GTX 1660 Ti crash for what a mixed batch does.
+    inline bool StageIsFake(const VkPipelineShaderStageCreateInfo& s) noexcept {
+        return IsFake(s.module);
     }
 
     // -----------------------------------------------------------------------
@@ -2028,6 +2093,9 @@ namespace {
         return h;
     }
     std::unordered_map<uint64_t, std::wstring>* g_replMap = nullptr;
+    // vkAllocateMemory failures: one counter so the first failure can print the reason once.
+    volatile LONG g_vkAllocFail = 0;
+    volatile LONG g_spvModulesSeen = 0;   // every vkCreateShaderModule the game performs
     // The replacement index lives in spvrw (further below); the config loader and
     // vkCreateInstance use these two entry points.
     void ForgetReplacementIndexImpl();
@@ -5542,6 +5610,12 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
                     LogLine("SPIRV SUMMARY: nothing in this log was rejected by the thresholds - the folder simply has no module for the stages listed as 'no file of this stage'");
             }
         }
+        if (hitExact + hitSim > 0)
+            LogLine("SPIRV SUMMARY: %ld of %ld compiled module(s) were replaced from spv_replace",
+                hitExact + hitSim, (long)g_spvModulesSeen);
+        else if (g_spvModulesSeen > 0)
+            LogLine("SPIRV SUMMARY: %ld module(s) were compiled and NOT ONE came from spv_replace in this run - if a replacement was expected, the folder and its index need a look",
+                (long)g_spvModulesSeen);
         if (hitExact + hitSim + miss == 0)
             LogLine("SPIRV SUMMARY: no shader went through the replacement lookup (self-test only, or the game never created a module)");
         else if (rejected == 0 && hitSim == 0)
@@ -5578,6 +5652,7 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         bool deny = false;
         std::string reason;
         bool rqOnly = false;      // uses RayQuery but no other ray-tracing feature (can be rewritten)
+        bool rtStage = false;     // entry point is a ray-tracing stage, not a raster stage
         bool denyOther = false;   // denied for a reason other than ray tracing
         bool rewritten = false;
         std::shared_ptr<std::vector<uint32_t>> code;   // final SPIR-V sent to the driver (for post-mortem dumps)
@@ -5715,6 +5790,13 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         }
         if (denyMeshHere && mesh)           { info.deny = true; info.denyOther = true; info.reason += "Mesh "; }
         info.rqOnly = rqCap && !rtHard && !nativeRQ && GetRtCompatMode() != RT_MODE_NATIVE;
+        // A module written for a ray-tracing STAGE (RayGeneration/Miss/ClosestHit/...)
+        // cannot be turned into anything the fixed-function pipeline understands. The
+        // only two honest options are "give it to the driver" or "there is no module".
+        // Half-doing it is what killed a GTX 1660 Ti run: the module became FAKE, so the
+        // pipeline became FAKE, and the game later handed that 0xFA4E... handle to the
+        // NVIDIA driver, which faulted on a -1 address inside its shader-module path.
+        info.rtStage = (info.model >= 5313 && info.model <= 5321);
         for (uint32_t c : capIds) {
             for (int k = 0; k < g_spvCfg.nDenyAnyCaps; ++k)
                 if (g_spvCfg.denyAnyCaps[k] == c) {
@@ -6530,6 +6612,28 @@ if (si.rewritten) return std::string();
             g_spvCfg.serializeCompile != 0, "shader-module");
     }
 
+    // Create a real, driver-owned module that draws nothing. Used whenever a stage
+    // had to be withheld from the driver: a valid handle keeps every later API call
+    // well-formed, while a FAKE 0xFA4E... handle makes the ICD fault (0xC0000005 on
+    // a GTX 1660 Ti run). Returns false only if the driver itself refuses it.
+    inline bool CreateNeutralModule(VkDevice device, VkShaderModule& out) noexcept {
+        out = VK_NULL_HANDLE;
+        auto real = RealExport<PFN_vkCreateShaderModule>("vkCreateShaderModule");
+        if (!real || !device) return false;
+        VkShaderModuleCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        ci.codeSize = sizeof(kNeutralVertexModule);
+        ci.pCode = kNeutralVertexModule;
+        VkShaderModule m = VK_NULL_HANDLE;
+        bool ok = true;
+        if (g_spvCfg.catchDriverCrash) ok = SehRun([&]() { real(device, &ci, nullptr, &m); });
+        else real(device, &ci, nullptr, &m);
+        if (!ok || m == VK_NULL_HANDLE) return false;
+        out = m;
+        return true;
+    }
+
+
     SRWLOCK* GetPipelineCacheLock(VkPipelineCache cache) {
         if (cache == VK_NULL_HANDLE) return nullptr;
         const uint64_t key = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cache));
@@ -7265,6 +7369,14 @@ vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* pInfo,
     const uint32_t* originalCode = pInfo->pCode;
     const size_t originalBytes = pInfo->codeSize;
     const uint64_t originalHash = Fnv1a64(originalCode, originalBytes);
+    // Every module the game compiles is seen here, whether or not anything replaces it.
+    // A log with thousands of modules and no "replacement ACCEPTED" line proves the
+    // folder was never used in that run - that is the fact a bug report needs.
+    {
+        const LONG mn = InterlockedIncrement(&g_spvModulesSeen);
+        if (mn == 1 || mn % 500 == 0)
+            LogLine("SPIRV: %ld shader module(s) handed to the proxy so far", mn);
+    }
     const uint32_t* code = originalCode;
     size_t nWords = originalBytes / sizeof(uint32_t);
     std::vector<uint32_t> replacement;
@@ -7464,6 +7576,16 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
         }
     }
     if (n % 200 == 0) LogLine("SHADER stats: total=%ld denied=%ld", n, (long)deniedSeen);
+    // A ray-tracing STAGE module can never be rewritten into a raster shader: there is
+    // nothing to lower it into. Saying so once per run explains the follow-up question
+    // ("why were 26 modules replaced by 'nothing'?") without needing anyone to read code.
+    if (si.deny && si.rtStage) {
+        static volatile LONG rtStageLogged = 0;
+        if (InterlockedIncrement(&rtStageLogged) == 1)
+            LogLine("SPIRV: shader #%ld is a ray-tracing stage module (model=%u). Such modules cannot be rewritten, "
+                "so they are replaced by a neutral module (draws nothing, no crash) - this is a consequence of the "
+                "RT POLICY line above, not a replacement failure", n, si.model);
+    }
     // A summary every 50 modules: the definitive one is logged at process detach, but a
     // game that is force-closed (or crashes) never gets there, and then the log has no
     // verdict at all even though shaders were processed.
@@ -7478,12 +7600,36 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
     // recovered BindBufferMemory crashes → black menu with audio/cursor only.
 
     if (si.deny) {
-        // The driver cannot run this module (GCN 2 has no fp16/int16/dot-product/RT/mesh).
+        // The driver cannot run this module (e.g. a GCN 2 card has no fp16/int16/dot-product/RT/mesh).
+        //
+        // The driver must still receive a VALID VkShaderModule. Handing out a FAKE
+        // handle here is not safe: the game keeps it, builds a pipeline from it (also
+        // FAKE), and the first driver call that touches that pipeline dereferences
+        // 0xFA4E000000000001 - which is exactly the 0xC0000005 at
+        // nvoglv64.dll+0xF484C1 seen in the GTX 1660 Ti log. A neutral module that
+        // produces no geometry is the honest outcome: nothing is drawn, nothing crashes.
         static volatile LONG fakeN = 0;
         LONG fn = InterlockedIncrement(&fakeN);
         if (fn <= 20 || fn % 50 == 0)
-            LogLine("vkCreateShaderModule #%ld -> FAKE module (reason=%s) totalFake=%ld", n, si.reason.c_str(), (long)fn);
-        *pShaderModule = MakeFake<VkShaderModule>();
+            LogLine("vkCreateShaderModule #%ld -> neutral module, geometry suppressed (reason=%s) totalDenied=%ld", n, si.reason.c_str(), (long)fn);
+        VkShaderModule neutral = VK_NULL_HANDLE;
+        {
+            VkShaderModuleCreateInfo nci{};
+            nci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            nci.codeSize = sizeof(kNeutralVertexModule);
+            nci.pCode = kNeutralVertexModule;
+            VkResult nr = VK_ERROR_UNKNOWN;
+            DriverCall([&]() { nr = real(device, &nci, pAllocator, &neutral); });
+            if (nr != VK_SUCCESS) neutral = VK_NULL_HANDLE;
+        }
+        if (neutral == VK_NULL_HANDLE) {
+            // The driver refused even the neutral module. A FAKE handle is then the
+            // only option left, but say so, because every later use of it is a risk.
+            LogLine("vkCreateShaderModule #%ld -> driver refused the neutral module; returning a FAKE handle (reason=%s)", n, si.reason.c_str());
+            *pShaderModule = MakeFake<VkShaderModule>();
+        } else {
+            *pShaderModule = neutral;
+        }
         PutSpvInfo(*pShaderModule, si);
         return VK_SUCCESS;
     }
@@ -7678,8 +7824,17 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
         }
     }
     if (r != VK_SUCCESS) {
-        LogLine("vkCreateShaderModule #%ld FAILED: result=%d caps=[%s] -> FAKE module", n, (int)r, si.caps.c_str());
-        *pShaderModule = MakeFake<VkShaderModule>();
+        // The driver refused the module itself (all variants tried). Fall back to the
+        // neutral module for the same reason as above: the game must not be able to
+        // hand a 0xFA4E... handle back to the ICD, which is an access violation.
+        VkShaderModule neutral = VK_NULL_HANDLE;
+        if (CreateNeutralModule(device, neutral)) {
+            LogLine("vkCreateShaderModule #%ld FAILED: result=%d caps=[%s] -> neutral module instead", n, (int)r, si.caps.c_str());
+            *pShaderModule = neutral;
+        } else {
+            LogLine("vkCreateShaderModule #%ld FAILED: result=%d caps=[%s] -> FAKE module (driver refused the neutral one too)", n, (int)r, si.caps.c_str());
+            *pShaderModule = MakeFake<VkShaderModule>();
+        }
         PutSpvInfo(*pShaderModule, si);
         return VK_SUCCESS;
     }
@@ -7955,9 +8110,32 @@ vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* pInfo,
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
     VkResult r = real(device, pInfo, pAllocator, pMemory);
     if (r != VK_SUCCESS) {
-        LogLine("vkAllocateMemory FAILED: result=%d size=%llu typeIdx=%u",
+        // A single "FAILED" line is not enough to tell an out-of-memory situation from a
+        // driver limit. The allocation really failed, but who has to change what depends
+        // on the reason, so say it once, loudly, instead of 1000 identical lines.
+        static volatile LONG firstFail = 0;
+        const long failNo = InterlockedIncrement(&g_vkAllocFail);
+        LogLine("vkAllocateMemory FAILED: result=%d size=%llu typeIdx=%u (failure #%ld)",
             (int)r, pInfo ? (unsigned long long)pInfo->allocationSize : 0,
-            pInfo ? pInfo->memoryTypeIndex : 0);
+            pInfo ? pInfo->memoryTypeIndex : 0, failNo);
+        if (InterlockedCompareExchange(&firstFail, 1, 0) == 0) {
+            wchar_t ini[2048]{};
+            GetLogPath(ini, sizeof(ini) / sizeof(ini[0]));
+            wchar_t* sl2 = wcsrchr(ini, L'\\');
+            const bool hasReplace = g_replMap && !g_replMap->empty();
+            if (sl2) {
+                wcscpy_s(sl2 + 1, (sizeof(ini) / sizeof(ini[0])) - static_cast<size_t>(sl2 + 1 - ini), L"VulkanProxy.ini");
+                // The proxy cannot invent memory. These three settings are the only ones
+                // that change how much the game asks for; everything else is the game.
+                LogLine("MEMORY: out of device memory - this is NOT a shader-replacement failure%s.", hasReplace ? "" : " (spv_replace is not even loaded)");
+                LogLine("MEMORY:   requested memory type %u, first failure at %llu bytes; the rest of this log will contain the same error",
+                    pInfo ? pInfo->memoryTypeIndex : 0, pInfo ? (unsigned long long)pInfo->allocationSize : 0);
+                LogLine("MEMORY:   1) close every other 3D app / browser tab (the game needs ~8-10 GB VRAM at 1080p)");
+                LogLine("MEMORY:   2) lower texture quality and resolution in the game menu");
+                LogLine("MEMORY:   3) do NOT raise BrightnessGain or ResolutionScale - both cost extra VRAM");
+                LogLine("MEMORY:   proof: if the log has no 'SPIRV: shader replacement ACCEPTED' line, no replacement was used in this run");
+            }
+        }
     } else {
         static volatile LONG count = 0;
         if (InterlockedIncrement(&count) <= 30) {
@@ -8594,22 +8772,54 @@ vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count
         bool anyFake = false;
         for (uint32_t i = 0; i < count; ++i) {
             for (uint32_t j = 0; j < pCreateInfos[i].stageCount && pCreateInfos[i].pStages; ++j)
-                if (IsFake(pCreateInfos[i].pStages[j].module)) { isFakePipe[i] = 1; anyFake = true; break; }
+                if (StageIsFake(pCreateInfos[i].pStages[j])) { isFakePipe[i] = 1; anyFake = true; break; }
         }
         if (anyFake) {
             static volatile LONG fakeBatches = 0;
             if (InterlockedIncrement(&fakeBatches) <= 40)
                 LogLine("vkCreateGraphicsPipelines: batch of %u contains FAKE-shader pipelines", count);
+            // One unusable pipeline must not hold the whole batch hostage, and the
+            // driver must never receive a FAKE handle. Replace the offending stage
+            // with the neutral module so the driver compiles the pipeline normally:
+            // it then draws nothing, which is quiet and harmless, instead of being
+            // an unknown handle the ICD dereferences later.
+            std::vector<std::vector<VkPipelineShaderStageCreateInfo>> patched(count);
             std::vector<VkGraphicsPipelineCreateInfo> sub;
-            for (uint32_t i = 0; i < count; ++i) if (!isFakePipe[i]) sub.push_back(pCreateInfos[i]);
-            std::vector<VkPipeline> subOut(sub.size(), VK_NULL_HANDLE);
+            sub.reserve(count);
+            size_t repairFailed = 0;
+            for (uint32_t i = 0; i < count; ++i) {
+                VkGraphicsPipelineCreateInfo ci = pCreateInfos[i];
+                if (isFakePipe[i] && ci.pStages && ci.stageCount) {
+                    patched[i].assign(ci.pStages, ci.pStages + ci.stageCount);
+                    bool repaired = true;
+                    for (auto& st : patched[i]) {
+                        if (!StageIsFake(st)) continue;
+                        VkShaderModule m = VK_NULL_HANDLE;
+                        if (CreateNeutralModule(device, m)) st.module = m;
+                        else { repaired = false; break; }
+                    }
+                    ci.pStages = patched[i].data();
+                    if (!repaired) { repairFailed++; isFakePipe[i] = 2; }
+                }
+                sub.push_back(ci);
+            }
+            if (repairFailed)
+                LogLine("vkCreateGraphicsPipelines: %zu pipeline(s) could not be repaired and stay FAKE", repairFailed);
+            std::vector<VkPipeline> subOut(count, VK_NULL_HANDLE);
             VkResult sr = VK_SUCCESS;
             if (!sub.empty())
-                sr = vkCreateGraphicsPipelines(device, cache, static_cast<uint32_t>(sub.size()), sub.data(), pAllocator, subOut.data());
-            size_t k = 0;
-            for (uint32_t i = 0; i < count; ++i)
-                if (pPipelines) pPipelines[i] = isFakePipe[i] ? MakeFake<VkPipeline>() : subOut[k++];
-            (void)sr;
+                sr = real(device, cache, static_cast<uint32_t>(sub.size()), sub.data(), pAllocator, subOut.data());
+            if (sr != VK_SUCCESS) {
+                LogLine("vkCreateGraphicsPipelines: batch with neutral stages failed (result=%d) -> no pipelines returned", (int)sr);
+                if (pPipelines) for (uint32_t i = 0; i < count; ++i) pPipelines[i] = VK_NULL_HANDLE;
+                return sr;
+            }
+            // Everything that compiled is a real driver pipeline, including the repaired
+            // ones (they simply draw nothing). Only a failed repair leaves a FAKE.
+            for (uint32_t i = 0; i < count; ++i) {
+                if (!pPipelines) break;
+                pPipelines[i] = subOut[i];
+            }
             return VK_SUCCESS;
         }
     }
@@ -8804,19 +9014,36 @@ vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_
         std::vector<char> isFakePipe(createInfoCount, 0);
         bool anyFake = false;
         for (uint32_t i = 0; i < createInfoCount; ++i)
-            if (IsFake(pCreateInfos[i].stage.module)) { isFakePipe[i] = 1; anyFake = true; }
+            if (StageIsFake(pCreateInfos[i].stage)) { isFakePipe[i] = 1; anyFake = true; }
         if (anyFake) {
             static volatile LONG fakeBatches = 0;
             if (InterlockedIncrement(&fakeBatches) <= 40)
                 LogLine("vkCreateComputePipelines: batch of %u contains FAKE-shader pipelines", createInfoCount);
-            std::vector<VkComputePipelineCreateInfo> sub;
-            for (uint32_t i = 0; i < createInfoCount; ++i) if (!isFakePipe[i]) sub.push_back(pCreateInfos[i]);
-            std::vector<VkPipeline> subOut(sub.size(), VK_NULL_HANDLE);
-            if (!sub.empty())
-                vkCreateComputePipelines(device, pipelineCache, static_cast<uint32_t>(sub.size()), sub.data(), pAllocator, subOut.data());
-            size_t k = 0;
-            for (uint32_t i = 0; i < createInfoCount; ++i)
-                if (pPipelines) pPipelines[i] = isFakePipe[i] ? MakeFake<VkPipeline>() : subOut[k++];
+            // Same rule as for graphics: substitute the neutral module, compile normally,
+            // never hand the driver a FAKE pipeline handle.
+            std::vector<VkComputePipelineCreateInfo> sub(pCreateInfos, pCreateInfos + createInfoCount);
+            size_t repairFailed = 0;
+            for (uint32_t i = 0; i < createInfoCount; ++i) {
+                if (!isFakePipe[i]) continue;
+                VkShaderModule m = VK_NULL_HANDLE;
+                if (CreateNeutralModule(device, m)) sub[i].stage.module = m;
+                else { repairFailed++; isFakePipe[i] = 2; }
+            }
+            if (repairFailed)
+                LogLine("vkCreateComputePipelines: %zu pipeline(s) could not be repaired and stay FAKE", repairFailed);
+            std::vector<VkPipeline> subOut(createInfoCount, VK_NULL_HANDLE);
+            VkResult cr = real(device, pipelineCache, createInfoCount, sub.data(), pAllocator, subOut.data());
+            if (cr != VK_SUCCESS) {
+                LogLine("vkCreateComputePipelines: batch with neutral stages failed (result=%d) -> no pipelines returned", (int)cr);
+                if (pPipelines) for (uint32_t i = 0; i < createInfoCount; ++i) pPipelines[i] = VK_NULL_HANDLE;
+                return cr;
+            }
+            // Everything that compiled is a real driver pipeline, including the repaired
+            // ones (they simply draw nothing). Only a failed repair leaves a FAKE.
+            for (uint32_t i = 0; i < createInfoCount; ++i) {
+                if (!pPipelines) break;
+                pPipelines[i] = subOut[i];
+            }
             return VK_SUCCESS;
         }
     }
