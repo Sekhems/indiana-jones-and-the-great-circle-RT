@@ -137,18 +137,36 @@ def main():
                 if re.search(r'(?<![\w.:>])%s\b' % re.escape(name), code):
                     problems.append((i + offset + 1, name, names[name]))
 
-    if not problems:
+    # The opposite mistake, and the one that cost two MSVC errors in one build:
+    # writing spvrw::Something() for a function that is NOT in spvrw (C2039). The check
+    # above cannot see it, because it only looks at names that ARE declared inside.
+    bogus = []
+    for i, line in enumerate(lines):
+        code = strip_noise(line)
+        for m in re.finditer(r'\b%s::(\w+)\b' % NSPACE, code):
+            if m.group(1) not in names:
+                bogus.append((i + 1, m.group(1)))
+
+    if not problems and not bogus:
         print('OK: every %s symbol used outside the namespace is qualified or forwarded '
               '(%d names checked)' % (NSPACE, len(names)))
         return 0
 
-    print('FAIL: declared inside namespace %s, used unqualified outside:' % NSPACE)
-    for line, name, decl in sorted(problems):
-        print('  dllmain.cpp(%d): %s   (declared at line %d)' % (line, name, decl))
-    print('\nFix: qualify the call as %s::%s(...), or add a forwarder next to\n'
-          'ForgetReplacementIndexImpl/RunReplacementSelfTest/NoteReplacementHit.'
-          % (NSPACE, sorted({p[1] for p in problems})[0]))
+    if bogus:
+        print('FAIL: qualified as %s::X but X does not exist inside namespace %s:' % (NSPACE, NSPACE))
+        for line, name in bogus:
+            print('  dllmain.cpp(%d): %s::%s' % (line, NSPACE, name))
+        print('\nFix: the function lives in the outer anonymous namespace - drop the\n'
+              'qualifier, or move/forward it. (MSVC reports this as C2039.)')
+    if problems:
+        print('FAIL: declared inside namespace %s, used unqualified outside:' % NSPACE)
+        for line, name, decl in sorted(problems):
+            print('  dllmain.cpp(%d): %s   (declared at line %d)' % (line, name, decl))
+        print('\nFix: qualify the call as %s::%s(...), or add a forwarder next to\n'
+              'ForgetReplacementIndexImpl/RunReplacementSelfTest/NoteReplacementHit.'
+              % (NSPACE, sorted({p[1] for p in problems})[0]))
     return 1
+
 
 
 if __name__ == '__main__':

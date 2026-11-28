@@ -149,6 +149,11 @@ namespace {
     // applied-not-found.
     constexpr const char* kProxyBuildNotes = "report after first frame | quiet trace | honest counts | AS/geometry evidence for SoftwareRT";
 
+    // A5: set by the device probe (below) and read by the acceleration-structure
+    // bookkeeping, which is defined much later in the file. Declared here because the
+    // probe needs it before the SoftwareRT block exists.
+    extern volatile LONG g_asVertexDataAddressable;
+
     // Version reported to the game when the real driver reports less.
     const uint32_t kSpoofMinApiMajorMinor = VK_MAKE_API_VERSION(0, 1, 3, 0);
 
@@ -5835,10 +5840,6 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     void NoteReplacementApplied(bool exact) { spvrw::NoteReplacementApplied(exact); }
     void NoteModuleStage(uint32_t stage, bool replaced, bool denied) { spvrw::NoteModuleStage(stage, replaced, denied); }
     void LogReplacementSummary() { spvrw::LogReplacementSummary(); }
-    // A4: forwarder - the report is built next to the counters it prints, but the
-    // first-present hook that schedules it lives outside this namespace.
-    void LogExitReportOnceAfterFirstPresent() { spvrw::LogExitReportOnceAfterFirstPresent(); }
-
     // Read-only view of the light counters, so the one-screen summary (which lives in
     // this namespace) can print them without reaching into spvrw's internals.
     void GetLightCounters(long& rqSeen, long& rqRewritten, long& withheld) {
@@ -8948,8 +8949,14 @@ vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInfo* pInfo,
         VKAPI_ATTR void VKAPI_CALL CmdBuildASIndirect(VkCommandBuffer, uint32_t,
             const VkAccelerationStructureBuildGeometryInfoKHR*, const VkDeviceAddress*, const uint32_t*,
             const uint32_t* const*) {}
-        VKAPI_ATTR VkResult VKAPI_CALL BuildAS(VkDevice, VkDeferredOperationKHR, uint32_t,
-            const VkAccelerationStructureBuildGeometryInfoKHR*, const VkAccelerationStructureBuildRangeInfoKHR* const*) {
+        // The device-level build is the same work as the command-buffer one, so it feeds
+        // the same counters. Counting only one of the two would under-report a game that
+        // builds on the host.
+        VKAPI_ATTR VkResult VKAPI_CALL BuildAS(VkDevice, VkDeferredOperationKHR, uint32_t infoCount,
+            const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
+            const VkAccelerationStructureBuildRangeInfoKHR* const*) {
+            InterlockedIncrement(&g_asStats.builds);
+            for (uint32_t i = 0; pInfos && i < infoCount; ++i) NoteAsGeometry(pInfos[i]);
             return VK_SUCCESS;
         }
         VKAPI_ATTR VkResult VKAPI_CALL CopyAS(VkDevice, VkDeferredOperationKHR, const VkCopyAccelerationStructureInfoKHR*) { return VK_SUCCESS; }
