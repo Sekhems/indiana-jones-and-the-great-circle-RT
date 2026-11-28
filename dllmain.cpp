@@ -142,12 +142,12 @@ namespace {
     // be tied to a version and a fixed bug was reported over and over.
     // Bump this on every behaviour change; the date/time comes from
     // the compiler so it is always the real build, not something to remember.
-    constexpr const char* kProxyVersion = "v20";
+    constexpr const char* kProxyVersion = "v21";
     // What changed in this build, printed once so a reader does not have to guess
     // whether a fix is present: RT is all-or-nothing, denied modules are replaced
     // by neutral ones, memory failures explain themselves, replacement counts are
     // applied-not-found.
-    constexpr const char* kProxyBuildNotes = "correct stage counts | SoftwareRT verdict from real AS calls";
+    constexpr const char* kProxyBuildNotes = "DumpLookupInput=-1 works | dump path and errors are logged";
 
     // A5: set by the device probe (below) and read by the acceleration-structure
     // bookkeeping, which is defined much later in the file. DEFINED here, not declared
@@ -2348,7 +2348,14 @@ namespace {
         }
         g_spvCfg.useReplacements = rd(L"UseReplacements", 1);
         g_spvCfg.dumpSamples = rd(L"DumpSamples", 0);
-        g_spvCfg.dumpLookupInput = rd(L"DumpLookupInput", 0);
+        // Parsed as text, not through GetPrivateProfileIntW: that call is documented for
+        // unsigned values and a negative one comes back as 0 (or garbage), which is
+        // exactly why DumpLookupInput=-1 silently produced no dumps at all.
+        {
+            wchar_t dv[32]{};
+            GetPrivateProfileStringW(L"spirv", L"DumpLookupInput", L"0", dv, 32, path);
+            g_spvCfg.dumpLookupInput = (int)wcstol(dv, nullptr, 10);
+        }
         g_spvCfg.verboseResourceK = rd(L"VerboseResourceK", 0);
         g_spvCfg.rewriteRayQuery = rd(L"RewriteRayQuery", 1);
         g_spvCfg.dumpRewrite = rd(L"DumpRewrite", 0);
@@ -2409,6 +2416,11 @@ namespace {
             path, g_spvCfg.denyFloat16, g_spvCfg.denyInt16, g_spvCfg.denyDotProduct,
             g_spvCfg.denyRayTracing, g_spvCfg.rewriteRayQuery, g_spvCfg.denyMesh, g_spvCfg.patchVersion, g_spvCfg.logAll,
             g_spvCfg.serializeCompile, g_spvCfg.catchDriverCrash, g_spvCfg.nDenyComputeAll, g_spvCfg.brightness);
+        // DumpLookupInput was not printed anywhere, so "I set it and nothing happened" was
+        // impossible to diagnose from the log. It is a diagnostic switch: say its value.
+        if (g_spvCfg.dumpLookupInput != 0)
+            LogLine("SPIRV: DumpLookupInput=%d - dumping modules next to this log (0 = off, -1 = every module)",
+                g_spvCfg.dumpLookupInput);
     }
 
     // Blocking, thread-safe: other threads must WAIT for the ini to be read, otherwise shaders created at the
@@ -7083,6 +7095,14 @@ if (si.rewritten) return std::string();
             WriteFile(f, code, static_cast<DWORD>(bytes), &w, nullptr);
             CloseHandle(f);
             LogLine("SPIRV: dumped %zu bytes to %ls", bytes, path);
+        } else {
+            // Was silent. A read-only programme folder, a redirected %TEMP% or a missing
+            // directory all looked exactly like "the proxy ignored my setting".
+            static volatile LONG writeFailLogged = 0;
+            if (InterlockedIncrement(&writeFailLogged) == 1)
+                LogLine("SPIRV: DUMP FAILED - cannot write %ls (error %lu). The folder is read-only or "
+                    "the path is not writable; move the game folder or fix permissions.",
+                    path, (unsigned long)GetLastError());
         }
     }
 
@@ -7934,7 +7954,10 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
     // produced a table where compute showed 0 replaced while 3 were accepted.
     NoteModuleStage(si.model, didReplace && !si.deny, si.deny);
     const bool logIt = g_spvCfg.logAll || (si.deny && dn <= 30) || n <= 10;
-    if (g_spvCfg.dumpLookupInput > 0) {
+    // NOTE: the condition is "!= 0", not "> 0". With "> 0" the documented
+    // DumpLookupInput=-1 ("dump every module") never entered this block and produced no
+    // files at all - the user set it, waited in the dark zone, and got nothing.
+    if (g_spvCfg.dumpLookupInput != 0) {
         // A1: the dumps are the raw material for new spv_replace files, so they are
         // prioritised instead of "first N modules the game happens to compile":
         //   1. modules that use ray tracing / ray query (that is where light is lost),
@@ -7955,6 +7978,15 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
         const LONG budget = dumpAll ? 0x7FFFFFFFL
             : (interesting ? g_spvCfg.dumpLookupInput : (g_spvCfg.dumpLookupInput / 4));
         if (budget > 0 && InterlockedIncrement(&dumpedInputs) <= budget) {
+            static volatile LONG firstDumpLogged = 0;
+            if (InterlockedIncrement(&firstDumpLogged) == 1) {
+                wchar_t where[2048]{};
+                GetLogPath(where, sizeof(where) / sizeof(where[0]));
+                wchar_t* s2 = wcsrchr(where, L'\\');
+                if (s2) *(s2 + 1) = 0;
+                LogLine("SPIRV: DUMPING SHADERS to %ls (name pattern spv_input_<stage>_<module>_<hash>.spv); "
+                    "put DumpLookupInput=0 back when done", where);
+            }
             char tag[80];
             _snprintf_s(tag, sizeof(tag), _TRUNCATE, "input_%u_%ld_%016llX", si.model, n,
                 static_cast<unsigned long long>(originalHash));
