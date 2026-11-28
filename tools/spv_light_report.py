@@ -155,8 +155,15 @@ def parse(path: Path) -> Module:
             m.model = int(parts[2])
         except ValueError:
             pass
-    if len(parts) >= 5:
-        m.hash = parts[4].upper()
+    # Hash is the last field before the trailing module number, whichever naming
+    # scheme produced the file:
+    #   older:  spv_input_<stage>_<module>_<hash>_<module>.spv   (module number twice)
+    #   v22:    spv_input_<stage>_<hash>_<module>.spv
+    # parts: ['spv','input',stage, ...rest]; the 16-hex field is the hash.
+    for part in reversed(parts[3:]):
+        if len(part) == 16 and all(c in "0123456789ABCDEFabcdef" for c in part):
+            m.hash = part.upper()
+            break
     try:
         words = read_words(path)
     except ValueError as e:

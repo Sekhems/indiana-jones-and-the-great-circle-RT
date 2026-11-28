@@ -142,12 +142,12 @@ namespace {
     // be tied to a version and a fixed bug was reported over and over.
     // Bump this on every behaviour change; the date/time comes from
     // the compiler so it is always the real build, not something to remember.
-    constexpr const char* kProxyVersion = "v21";
+    constexpr const char* kProxyVersion = "v22";
     // What changed in this build, printed once so a reader does not have to guess
     // whether a fix is present: RT is all-or-nothing, denied modules are replaced
     // by neutral ones, memory failures explain themselves, replacement counts are
     // applied-not-found.
-    constexpr const char* kProxyBuildNotes = "DumpLookupInput=-1 works | dump path and errors are logged";
+    constexpr const char* kProxyBuildNotes = "dump names carry the module number once | report reads both schemes";
 
     // A5: set by the device probe (below) and read by the acceleration-structure
     // bookkeeping, which is defined much later in the file. DEFINED here, not declared
@@ -7988,7 +7988,10 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
                     "put DumpLookupInput=0 back when done", where);
             }
             char tag[80];
-            _snprintf_s(tag, sizeof(tag), _TRUNCATE, "input_%u_%ld_%016llX", si.model, n,
+            // DumpSpirv() appends the module number itself (..\spv_<tag>_<idx>.spv), so
+            // the tag must NOT repeat it: real files came out as
+            // spv_input_4_333_2EDB784FA8E47B14_333.spv with the number twice.
+            _snprintf_s(tag, sizeof(tag), _TRUNCATE, "input_%u_%016llX", si.model,
                 static_cast<unsigned long long>(originalHash));
             DumpSpirv(tag, n, originalCode, originalBytes);
             LogLine("SPIRV: dumped module #%ld for inspection (stage %u, hash %016llX, %s%s)", n, si.model,
