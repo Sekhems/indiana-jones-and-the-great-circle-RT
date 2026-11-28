@@ -1,0 +1,71 @@
+Read 1054 dumped module(s): 1054 parsed, 0 unreadable.
+By stage: compute 346, fragment 337, vertex 371
+
+Modules that actually evaluate rays (OpRayQuery*): 96
+  These are rewritten to 'no hit' today, so their lighting is what turns black.
+
+Candidates, best evidence first
+  #  stage         rays  smp light-names  hash             verdict
+  1  fragment        32  133           0  2EDB784FA8E47B14 ROBUST AIM: evaluates rays, its lighting was rewritten to 'no hit'
+  2  fragment        32  133           0  AD81B30A49B4A7A9 ROBUST AIM: evaluates rays, its lighting was rewritten to 'no hit'
+  3  fragment        32  131           0  38F75C1DAF7CAD83 ROBUST AIM: evaluates rays, its lighting was rewritten to 'no hit'
+  4  fragment        32  127           0  CFF0B005B0015591 ROBUST AIM: evaluates rays, its lighting was rewritten to 'no hit'
+  5  fragment        32  126           0  57B8F24DC76B3F2E ROBUST AIM: evaluates rays, its lighting was rewritten to 'no hit'
+  6  fragment        32  126           0  E11F0DA45CADD920 ROBUST AIM: evaluates rays, its lighting was rewritten to 'no hit'
+  7  fragment        32  126           0  E11F0DA45CADD920 ROBUST AIM: evaluates rays, its lighting was rewritten to 'no hit'
+  8  fragment        32  126           0  57B8F24DC76B3F2E ROBUST AIM: evaluates rays, its lighting was rewritten to 'no hit'
+  9  fragment        32  126           0  EDA4685430A65B89 ROBUST AIM: evaluates rays, its lighting was rewritten to 'no hit'
+ 10  fragment        32  126           0  C63B7EC79F9FB734 ROBUST AIM: evaluates rays, its lighting was rewritten to 'no hit'
+ 11  fragment        32  126           0  ADE8A0721ADC81B4 ROBUST AIM: evaluates rays, its lighting was rewritten to 'no hit'
+ 12  fragment        32  126           0  C63B7EC79F9FB734 ROBUST AIM: evaluates rays, its lighting was rewritten to 'no hit'
+ 13  fragment        32  125           0  EB9F4C07525FC0A8 ROBUST AIM: evaluates rays, its lighting was rewritten to 'no hit'
+ 14  fragment        32  124           0  71E8E8354D09B505 ROBUST AIM: evaluates rays, its lighting was rewritten to 'no hit'
+ 15  fragment        32  124           0  A3EAE2CA741721A4 ROBUST AIM: evaluates rays, its lighting was rewritten to 'no hit'
+
+To act on this: a replacement file must be named after the hash of the module
+the game compiles on THIS machine, so the name is read from the dump:
+  spv_input_4_333_2EDB784FA8E47B14_333.spv
+      -> save the hand-made replacement as: spv_2EDB784FA8E47B14.spv
+      -> check it can serve the folder: spv_check.exe "<spv_replace>" "F:\Indiana Jones and the Great Circle (2024)\The Great Circle\spv_input_4_333_2EDB784FA8E47B14_333.spv"
+  spv_input_4_539_AD81B30A49B4A7A9_539.spv
+      -> save the hand-made replacement as: spv_AD81B30A49B4A7A9.spv
+      -> check it can serve the folder: spv_check.exe "<spv_replace>" "F:\Indiana Jones and the Great Circle (2024)\The Great Circle\spv_input_4_539_AD81B30A49B4A7A9_539.spv"
+  spv_input_4_102_38F75C1DAF7CAD83_102.spv
+      -> save the hand-made replacement as: spv_38F75C1DAF7CAD83.spv
+      -> check it can serve the folder: spv_check.exe "<spv_replace>" "F:\Indiana Jones and the Great Circle (2024)\The Great Circle\spv_input_4_102_38F75C1DAF7CAD83_102.spv"
+  spv_input_4_575_CFF0B005B0015591_575.spv
+      -> save the hand-made replacement as: spv_CFF0B005B0015591.spv
+      -> check it can serve the folder: spv_check.exe "<spv_replace>" "F:\Indiana Jones and the Great Circle (2024)\The Great Circle\spv_input_4_575_CFF0B005B0015591_575.spv"
+  spv_input_4_226_57B8F24DC76B3F2E_226.spv
+      -> save the hand-made replacement as: spv_57B8F24DC76B3F2E.spv
+      -> check it can serve the folder: spv_check.exe "<spv_replace>" "F:\Indiana Jones and the Great Circle (2024)\The Great Circle\spv_input_4_226_57B8F24DC76B3F2E_226.spv"
+  spv_input_4_228_E11F0DA45CADD920_228.spv
+      -> save the hand-made replacement as: spv_E11F0DA45CADD920.spv
+      -> check it can serve the folder: spv_check.exe "<spv_replace>" "F:\Indiana Jones and the Great Circle (2024)\The Great Circle\spv_input_4_228_E11F0DA45CADD920_228.spv"
+  spv_input_4_356_E11F0DA45CADD920_356.spv
+      -> save the hand-made replacement as: spv_E11F0DA45CADD920.spv
+      -> check it can serve the folder: spv_check.exe "<spv_replace>" "F:\Indiana Jones and the Great Circle (2024)\The Great Circle\spv_input_4_356_E11F0DA45CADD920_356.spv"
+  spv_input_4_420_57B8F24DC76B3F2E_420.spv
+      -> save the hand-made replacement as: spv_57B8F24DC76B3F2E.spv
+      -> check it can serve the folder: spv_check.exe "<spv_replace>" "F:\Indiana Jones and the Great Circle (2024)\The Great Circle\spv_input_4_420_57B8F24DC76B3F2E_420.spv"
+  spv_input_4_582_EDA4685430A65B89_582.spv
+      -> save the hand-made replacement as: spv_EDA4685430A65B89.spv
+      -> check it can serve the folder: spv_check.exe "<spv_replace>" "F:\Indiana Jones and the Great Circle (2024)\The Great Circle\spv_input_4_582_EDA4685430A65B89_582.spv"
+  spv_input_4_685_C63B7EC79F9FB734_685.spv
+      -> save the hand-made replacement as: spv_C63B7EC79F9FB734.spv
+      -> check it can serve the folder: spv_check.exe "<spv_replace>" "F:\Indiana Jones and the Great Circle (2024)\The Great Circle\spv_input_4_685_C63B7EC79F9FB734_685.spv"
+  spv_input_4_687_ADE8A0721ADC81B4_687.spv
+      -> save the hand-made replacement as: spv_ADE8A0721ADC81B4.spv
+      -> check it can serve the folder: spv_check.exe "<spv_replace>" "F:\Indiana Jones and the Great Circle (2024)\The Great Circle\spv_input_4_687_ADE8A0721ADC81B4_687.spv"
+  spv_input_4_688_C63B7EC79F9FB734_688.spv
+      -> save the hand-made replacement as: spv_C63B7EC79F9FB734.spv
+      -> check it can serve the folder: spv_check.exe "<spv_replace>" "F:\Indiana Jones and the Great Circle (2024)\The Great Circle\spv_input_4_688_C63B7EC79F9FB734_688.spv"
+  spv_input_4_95_EB9F4C07525FC0A8_95.spv
+      -> save the hand-made replacement as: spv_EB9F4C07525FC0A8.spv
+      -> check it can serve the folder: spv_check.exe "<spv_replace>" "F:\Indiana Jones and the Great Circle (2024)\The Great Circle\spv_input_4_95_EB9F4C07525FC0A8_95.spv"
+  spv_input_4_572_71E8E8354D09B505_572.spv
+      -> save the hand-made replacement as: spv_71E8E8354D09B505.spv
+      -> check it can serve the folder: spv_check.exe "<spv_replace>" "F:\Indiana Jones and the Great Circle (2024)\The Great Circle\spv_input_4_572_71E8E8354D09B505_572.spv"
+  spv_input_4_574_A3EAE2CA741721A4_574.spv
+      -> save the hand-made replacement as: spv_A3EAE2CA741721A4.spv
+      -> check it can serve the folder: spv_check.exe "<spv_replace>" "F:\Indiana Jones and the Great Circle (2024)\The Great Circle\spv_input_4_574_A3EAE2CA741721A4_574.spv"
