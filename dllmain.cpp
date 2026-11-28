@@ -142,12 +142,12 @@ namespace {
     // be tied to a version and a fixed bug was reported over and over.
     // Bump this on every behaviour change; the date/time comes from
     // the compiler so it is always the real build, not something to remember.
-    constexpr const char* kProxyVersion = "v18";
+    constexpr const char* kProxyVersion = "v19";
     // What changed in this build, printed once so a reader does not have to guess
     // whether a fix is present: RT is all-or-nothing, denied modules are replaced
     // by neutral ones, memory failures explain themselves, replacement counts are
     // applied-not-found.
-    constexpr const char* kProxyBuildNotes = "report printed after first frame too | per-descriptor trace off by default | honest denied/rewritten counts | dump limit announced";
+    constexpr const char* kProxyBuildNotes = "report after first frame | quiet trace | honest counts | AS/geometry evidence for SoftwareRT";
 
     // Version reported to the game when the real driver reports less.
     const uint32_t kSpoofMinApiMajorMinor = VK_MAKE_API_VERSION(0, 1, 3, 0);
@@ -576,6 +576,11 @@ namespace {
             LogLine("GPU SHADER PROFILE: Float16=%u Int16=%u DotProduct=%u Float64=%u Int64=%u Storage16=%u Storage8=%u Mesh=%u (probed=%u)",
                 result.realFloat16, result.realInt16, result.realDotProduct, result.realFloat64,
                 result.realInt64, result.realStorage16, result.realStorage8, result.realMesh, result.capsProbed);
+            // A5: software ray tracing needs the game's vertex data to be reachable, and
+            // bufferDeviceAddress is what makes a device address readable at all.
+            InterlockedExchange(&g_asVertexDataAddressable, result.featureBDA ? 1 : 0);
+            LogLine("SOFTWARE RT: buffer device address = %u (needed to read the game's vertex data for any software tracer)",
+                result.featureBDA ? 1u : 0u);
             LogLine("GPU RT PROFILE: tier=%s API=%u.%u AS(ext=%u feature=%u native=%u virtual=%u) RTP(ext=%u feature=%u native=%u virtual=%u) RQ(ext=%u feature=%u native=%u virtual=%u)",
                 RtTierName(result.tier), VK_API_VERSION_MAJOR(result.apiVersion), VK_API_VERSION_MINOR(result.apiVersion),
                 result.extAS, result.featureAS, result.nativeAS, result.virtualAS,
@@ -2146,6 +2151,77 @@ namespace {
     // vkAllocateMemory failures: one counter so the first failure can print the reason once.
     volatile LONG g_vkAllocFail = 0;
     volatile LONG g_spvModulesSeen = 0;   // every vkCreateShaderModule the game performs
+
+    // -----------------------------------------------------------------------
+    // A5 (SoftwareRT, step 1): remember the acceleration structures the game builds.
+    //
+    // The RT stubs in namespace stub return success and drop everything, so today the
+    // proxy has no idea whether the game even builds a scene: "PROXY RT fallback via
+    // GIPA: vkCmdBuildAccelerationStructuresKHR" is printed when the FUNCTION is handed
+    // out, not when the game calls it. That is the difference between "the game gives us
+    // geometry to trace" and "the game draws raster and only queries rays" - and no
+    // software RT can be planned without knowing which one it is.
+    //
+    // This does not trace anything yet, and it changes no driver behaviour: it only
+    // records what arrives and prints one honest line about it.
+    struct AsBuildStats {
+        volatile LONG builds = 0;          // vkCmdBuildAccelerationStructuresKHR calls
+        volatile LONG buildIndirect = 0;   // ...IndirectKHR calls
+        volatile LONG geometryCount = 0;   // total geometries across all builds
+        volatile LONG triangleCount = 0;   // triangles described by the geometry infos
+        volatile LONG withVertexData = 0;  // geometries whose vertex buffer we can address
+        volatile LONG asCreated = 0;       // vkCreateAccelerationStructureKHR calls
+        volatile LONG traceRays = 0;       // vkCmdTraceRaysKHR calls
+        volatile LONG rtPipelines = 0;     // vkCreateRayTracingPipelinesKHR calls
+    };
+    AsBuildStats g_asStats;
+
+    // Vertex data is only reachable if the buffer address can be resolved. On a Vulkan
+    // 1.2 driver bufferDeviceAddress is the only way to turn the game's device address
+    // into memory we can read, so the flag is kept here and printed with the summary.
+    volatile LONG g_asVertexDataAddressable = 0;
+    volatile LONG g_asSummaryLogged = 0;
+
+    inline void NoteAsGeometry(const VkAccelerationStructureBuildGeometryInfoKHR& info) {
+        const uint32_t n = info.geometryCount;
+        if (!info.pGeometries && !info.ppGeometries) return;
+        // "how many geometries arrived", not "how many build calls": the counter is
+        // incremented per geometry below, together with the geometry data.
+        for (uint32_t i = 0; i < n; ++i) {
+            const VkAccelerationStructureGeometryKHR* g = info.pGeometries
+                ? &info.pGeometries[i]
+                : (info.ppGeometries ? info.ppGeometries[i] : nullptr);
+            if (!g) continue;
+            InterlockedIncrement(&g_asStats.geometryCount);
+            if (g->geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
+                const auto& tri = g->geometry.triangles;
+                if (tri.maxVertex > 0) InterlockedAdd(&g_asStats.triangleCount, (LONG)tri.maxVertex);
+                else InterlockedIncrement(&g_asStats.triangleCount);
+                if (tri.vertexData.deviceAddress != 0 && g_asVertexDataAddressable)
+                    InterlockedIncrement(&g_asStats.withVertexData);
+            }
+        }
+    }
+
+    // One line at exit, and only when the game actually used acceleration structures:
+    // if it never builds any, the honest answer is "there is no geometry to trace on this
+    // machine" and software ray tracing cannot change the picture at all.
+    void LogSoftwareRtReadiness() {
+        if (InterlockedIncrement(&g_asSummaryLogged) != 1) return;
+        const LONG builds = g_asStats.builds + g_asStats.buildIndirect;
+        if (g_asStats.asCreated == 0 && builds == 0 && g_asStats.traceRays == 0) {
+            LogLine("SOFTWARE RT: the game never created or built an acceleration structure and never traced rays - "
+                "there is no geometry to trace here, so software ray tracing cannot change the picture");
+            return;
+        }
+        LogLine("SOFTWARE RT: AS built %ld time(s) (%ld indirect), %ld geometr(ies), ~%ld vertices; vertex data addressable: %s",
+            (long)g_asStats.builds, (long)g_asStats.buildIndirect, (long)g_asStats.geometryCount,
+            (long)g_asStats.triangleCount, g_asVertexDataAddressable ? "yes" : "no (no bufferDeviceAddress)");
+        LogLine("SOFTWARE RT: traceRays %ld, RT pipelines %ld, AS objects %ld",
+            (long)g_asStats.traceRays, (long)g_asStats.rtPipelines, (long)g_asStats.asCreated);
+        if (g_asStats.withVertexData == 0 && g_asStats.geometryCount > 0)
+            LogLine("SOFTWARE RT: geometry arrives WITHOUT readable vertex buffers - a CPU/GPU tracer cannot be built on this path without buffer device addresses");
+    }
     // The replacement index lives in spvrw (further below); the config loader and
     // vkCreateInstance use these two entry points.
     void ForgetReplacementIndexImpl();
@@ -5799,6 +5875,7 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
                 vSeen, vHit, fSeen, fHit, cSeen, cHit);
         LogLine("PROXY SUMMARY: light       : %ld module(s) touch ray tracing, %ld rewritten to 'no hit', %ld withheld from the driver",
             rqSeen, rqRewritten, withheld);
+        LogSoftwareRtReadiness();
         LogLine("PROXY SUMMARY: crashes     : %ld driver crash(es) caught, %ld allocation failure(s)",
             (long)g_driverCrashCount, (long)g_vkAllocFail);
         if ((long)g_vkAllocFail > 0)
@@ -8855,12 +8932,19 @@ vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInfo* pInfo,
         VKAPI_ATTR VkResult VKAPI_CALL CreateAS(VkDevice, const VkAccelerationStructureCreateInfoKHR*,
             const VkAllocationCallbacks*, VkAccelerationStructureKHR* p) {
             if (!p) return VK_ERROR_INITIALIZATION_FAILED;
+            InterlockedIncrement(&g_asStats.asCreated);
             *p = MakeFake<VkAccelerationStructureKHR>();
             return VK_SUCCESS;
         }
         VKAPI_ATTR void VKAPI_CALL DestroyAS(VkDevice, VkAccelerationStructureKHR, const VkAllocationCallbacks*) {}
-        VKAPI_ATTR void VKAPI_CALL CmdBuildAS(VkCommandBuffer, uint32_t,
-            const VkAccelerationStructureBuildGeometryInfoKHR*, const VkAccelerationStructureBuildRangeInfoKHR* const*) {}
+        // A5: this is the hook where the geometry arrives. Nothing is traced or stored
+        // yet - the counters only answer "does the game hand us a scene at all?".
+        VKAPI_ATTR void VKAPI_CALL CmdBuildAS(VkCommandBuffer, uint32_t infoCount,
+            const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
+            const VkAccelerationStructureBuildRangeInfoKHR* const*) {
+            InterlockedIncrement(&g_asStats.builds);
+            for (uint32_t i = 0; pInfos && i < infoCount; ++i) NoteAsGeometry(pInfos[i]);
+        }
         VKAPI_ATTR void VKAPI_CALL CmdBuildASIndirect(VkCommandBuffer, uint32_t,
             const VkAccelerationStructureBuildGeometryInfoKHR*, const VkDeviceAddress*, const uint32_t*,
             const uint32_t* const*) {}
@@ -8899,13 +8983,16 @@ vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInfo* pInfo,
         }
         VKAPI_ATTR void VKAPI_CALL CmdTraceRays(VkCommandBuffer, const VkStridedDeviceAddressRegionKHR*,
             const VkStridedDeviceAddressRegionKHR*, const VkStridedDeviceAddressRegionKHR*,
-            const VkStridedDeviceAddressRegionKHR*, uint32_t, uint32_t, uint32_t) {}
+            const VkStridedDeviceAddressRegionKHR*, uint32_t, uint32_t, uint32_t) {
+            InterlockedIncrement(&g_asStats.traceRays);
+        }
         VKAPI_ATTR void VKAPI_CALL CmdTraceRaysIndirect(VkCommandBuffer, const VkStridedDeviceAddressRegionKHR*,
             const VkStridedDeviceAddressRegionKHR*, const VkStridedDeviceAddressRegionKHR*,
             const VkStridedDeviceAddressRegionKHR*, VkDeviceAddress) {}
         VKAPI_ATTR void VKAPI_CALL CmdTraceRaysIndirect2(VkCommandBuffer, VkDeviceAddress) {}
         VKAPI_ATTR VkResult VKAPI_CALL CreateRTPipelines(VkDevice, VkDeferredOperationKHR, VkPipelineCache,
             uint32_t count, const VkRayTracingPipelineCreateInfoKHR*, const VkAllocationCallbacks*, VkPipeline* p) {
+            if (count) InterlockedAdd(&g_asStats.rtPipelines, (LONG)count);
             if (p) for (uint32_t i = 0; i < count; ++i) p[i] = MakeFake<VkPipeline>();
             return VK_SUCCESS;
         }
