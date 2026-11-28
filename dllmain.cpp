@@ -136,6 +136,19 @@ vkGetPhysicalDeviceFeatures(VkPhysicalDevice pd, VkPhysicalDeviceFeatures* pFeat
 // Configuration + helpers
 // ---------------------------------------------------------------------------
 namespace {
+    // -----------------------------------------------------------------------
+    // Build identity. A log is only useful if it says which build produced it:
+    // before this, every build wrote "v16 RT-TIERS", so a crash report could not
+    // be tied to a version and a fixed bug was reported over and over.
+    // Bump this on every behaviour change; the date/time comes from
+    // the compiler so it is always the real build, not something to remember.
+    constexpr const char* kProxyVersion = "v17";
+    // What changed in this build, printed once so a reader does not have to guess
+    // whether a fix is present: RT is all-or-nothing, denied modules are replaced
+    // by neutral ones, memory failures explain themselves, replacement counts are
+    // applied-not-found.
+    constexpr const char* kProxyBuildNotes = "RT all-or-nothing | neutral module instead of FAKE | MEMORY diagnosis | applied replacement counts";
+
     // Version reported to the game when the real driver reports less.
     const uint32_t kSpoofMinApiMajorMinor = VK_MAKE_API_VERSION(0, 1, 3, 0);
 
@@ -772,7 +785,9 @@ namespace {
             g_realGdpa = nullptr;
             return TRUE;
         }
-        LogLine("=== VulkanProxy v16 RT-TIERS === Loaded system Loader: %ls", systemDirectory);
+        LogLine("=== VulkanProxy %s RT-TIERS === build %s %s === Loaded system Loader: %ls",
+            kProxyVersion, __DATE__, __TIME__, systemDirectory);
+        LogLine("=== %s: %s", kProxyVersion, kProxyBuildNotes);
         return TRUE;
     }
 
@@ -2099,6 +2114,7 @@ namespace {
         int forceVirtualRtByDefault = 0; // 1 = treat every GPU as "no RT at all" (old, uniform behaviour)
         int dumpSamples = 0;       // dump N working compute shaders of two kinds (for comparison with crashing ones)
         int dumpLookupInput = 0;   // dump the first N modules the game hands over, to compare offline with spv_replace
+        int verboseResourceK = 0;  // resource-bind heartbeat every N thousand bindings (0 = silent)
         int serializeCompile = 1; // one thread at a time inside driver shader/pipeline compilation
         int promoteFloat16 = 0;   // старый промоутер - ВЫКЛ (ломает layout буферов)
         int lowerFp16 = 0;        // ВЫКЛ: заменяем на комбинированный проход
@@ -2248,6 +2264,7 @@ namespace {
         g_spvCfg.useReplacements = rd(L"UseReplacements", 1);
         g_spvCfg.dumpSamples = rd(L"DumpSamples", 0);
         g_spvCfg.dumpLookupInput = rd(L"DumpLookupInput", 0);
+        g_spvCfg.verboseResourceK = rd(L"VerboseResourceK", 0);
         g_spvCfg.rewriteRayQuery = rd(L"RewriteRayQuery", 1);
         g_spvCfg.dumpRewrite = rd(L"DumpRewrite", 0);
         g_spvCfg.dumpRewriteFail = rd(L"DumpRewriteFail", 3);
@@ -5124,6 +5141,13 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     // printed "3 accepted (exact hash)" next to "NOT ONE came from spv_replace" because
     // the byte-hash path incremented one counter and the summary read the other.
     volatile LONG g_replAppliedExact = 0, g_replAppliedSimilar = 0;
+    // A2: where the light is lost. A module that uses RayQuery but no other ray-tracing
+    // feature can be rewritten (queries become "no hit"), and in a shader that computed
+    // indirect light from those hits that is a dark zone. Any other RT module cannot be
+    // rewritten at all and is withheld, which is worse. Counting the three cases tells
+    // a reader immediately whether the darkness is "rewritten to nothing" or "nothing
+    // to rewrite with".
+    volatile LONG g_lightRqShaders = 0, g_lightRqRewritten = 0, g_lightRqWithheld = 0;
     // Why a lookup missed: no module of this stage is even close (expected - the folder
     // holds a handful of files, the game compiles hundreds), or a plausible candidate
     // was rejected by the thresholds (actionable).
@@ -5618,6 +5642,17 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         else InterlockedIncrement(&g_replAppliedSimilar);
     }
 
+    // D1: read-only counters for the one-screen summary, which lives in the anonymous
+    // namespace and therefore cannot see these variables directly.
+    void GetSummaryCounters(long& compiled, long& replaced,
+        long& vSeen, long& vHit, long& fSeen, long& fHit, long& cSeen, long& cHit) {
+        compiled = g_spvModulesSeen;
+        replaced = g_replAppliedExact + g_replAppliedSimilar;
+        vSeen = g_stageSeen[0]; vHit = g_stageHit[0];
+        fSeen = g_stageSeen[1]; fHit = g_stageHit[1];
+        cSeen = g_stageSeen[2]; cHit = g_stageHit[2];
+    }
+
     // One line at shutdown: whether the folder was actually used, or only matched in the
     // self-test. Without it a log that ends after "SELFTEST PASSED" is ambiguous.
     void LogReplacementSummary() {
@@ -5720,6 +5755,54 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     void NoteReplacementApplied(bool exact) { spvrw::NoteReplacementApplied(exact); }
     void NoteModuleStage(uint32_t stage, bool replaced, bool denied) { spvrw::NoteModuleStage(stage, replaced, denied); }
     void LogReplacementSummary() { spvrw::LogReplacementSummary(); }
+    // Read-only view of the light counters, so the one-screen summary (which lives in
+    // this namespace) can print them without reaching into spvrw's internals.
+    void GetLightCounters(long& rqSeen, long& rqRewritten, long& withheld) {
+        rqSeen = spvrw::g_lightRqShaders;
+        rqRewritten = spvrw::g_lightRqRewritten;
+        withheld = spvrw::g_lightRqWithheld;
+    }
+
+    // Declared here because the summary below is defined before the driver-call
+    // machinery that owns this counter (definition is further down, same namespace).
+    extern volatile LONG g_driverCrashCount;
+
+    // D1: the one screen a user should have to read. A 25000-line log cannot be
+    // summarised by hand; this block is the whole story in a fixed order - which
+    // build, what the RT policy is, did the folder work, was there a crash, did
+    // the proxy run out of memory, and the per-stage split of the shaders.
+    // It lives in the anonymous namespace because it needs globals from both sides
+    // of the file (spvrw counters and the proxy-wide g_rtSpoof / g_driverCrashCount).
+    void LogProxySummary() {
+        // Which build this is. Every earlier build printed the same banner, so a crash
+        // report could not be tied to a version.
+        LogLine("PROXY SUMMARY: ---------- one-screen report ----------");
+        LogLine("PROXY SUMMARY: build       : %s (%s %s) | %s", kProxyVersion, __DATE__, __TIME__, kProxyBuildNotes);
+        LogLine("PROXY SUMMARY: ray tracing : %s",
+            g_rtSpoof ? "virtual - the game cannot build RT modules on this adapter"
+                      : "native - the driver handles ray tracing, the proxy does not touch those modules");
+        long rqSeen = 0, rqRewritten = 0, withheld = 0;
+        GetLightCounters(rqSeen, rqRewritten, withheld);
+        long compiled = 0, replaced = 0, vSeen = 0, vHit = 0, fSeen = 0, fHit = 0, cSeen = 0, cHit = 0;
+        spvrw::GetSummaryCounters(compiled, replaced, vSeen, vHit, fSeen, fHit, cSeen, cHit);
+        LogLine("PROXY SUMMARY: shaders     : %ld compiled by the game, %ld replaced from spv_replace", compiled, replaced);
+        if (vSeen || fSeen || cSeen)
+            LogLine("PROXY SUMMARY:   vertex %ld / %ld replaced | fragment %ld / %ld replaced | compute %ld / %ld replaced",
+                vSeen, vHit, fSeen, fHit, cSeen, cHit);
+        LogLine("PROXY SUMMARY: light       : %ld module(s) touch ray tracing, %ld rewritten to 'no hit', %ld withheld from the driver",
+            rqSeen, rqRewritten, withheld);
+        LogLine("PROXY SUMMARY: crashes     : %ld driver crash(es) caught, %ld allocation failure(s)",
+            (long)g_driverCrashCount, (long)g_vkAllocFail);
+        if ((long)g_vkAllocFail > 0)
+            LogLine("PROXY SUMMARY: verdict     : OUT OF DEVICE MEMORY - lower texture quality/resolution; this is not a replacement problem");
+        else if ((long)g_driverCrashCount > 0)
+            LogLine("PROXY SUMMARY: verdict     : the driver crashed and was caught - attach the 'CAUGHT driver crash' lines");
+        else if (replaced > 0)
+            LogLine("PROXY SUMMARY: verdict     : healthy - %ld replacement(s) applied, no crash, no out-of-memory", replaced);
+        else
+            LogLine("PROXY SUMMARY: verdict     : no crash and no replacement; the folder has no module for these shaders or was not used");
+        LogLine("PROXY SUMMARY: ---------- end of report ----------");
+    }
     void RunReplacementSelfTest(int mode) { spvrw::RunReplacementSelfTest(mode); }
 
     // ---- SPIR-V module info ---------------------------------------------------
@@ -5851,23 +5934,49 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         if (denyF16 && f16)    { info.deny = true; info.denyOther = true; info.reason += "Float16 "; }
         if (denyI16 && i16)    { info.deny = true; info.denyOther = true; info.reason += "Int16 "; }
         if (denyDot && dot)    { info.deny = true; info.denyOther = true; info.reason += "DotProduct "; }
-        // Do not blanket-deny RT on capable GPUs. In Hybrid, native pipeline
-        // stages stay native while only unsupported RayQuery is rewritten.
+        // ---------------------------------------------------------------------
+        // Ray tracing: one policy, and the INI switch is part of it.
+        //
+        // DenyRayTracing used to be read and logged but never consulted - a dead
+        // switch that looked alive, which is worse than no switch. It is now a real
+        // override with one meaning:
+        //   DenyRayTracing=1 (default) -> hardware decides. A module the driver cannot
+        //       run is denied, a module it can run is passed through untouched. This
+        //       is what keeps the shader set identical across vendors.
+        //   DenyRayTracing=0          -> "I want native ray tracing on this card": no
+        //       RT module is denied or rewritten just because of RT. Unsupported
+        //       SPIR-V may then reach the ICD, so this is only for cards that really
+        //       report the feature. The log says so (RT POLICY / this line).
+        //
+        // Denying a ray-tracing STAGE is never a rewrite decision: such a module has
+        // no raster equivalent, so it is withheld (neutral module) rather than faked.
         if (rt) {
-            // Hardware capability policy is authoritative. The legacy
-            // DenyRayTracing=0 switch must not pass unsupported RT SPIR-V to an ICD.
-            const bool unsupportedRQ = rqCap && !nativeRQ;
-            const bool unsupportedPipeline = rtHard && !nativeRTP;
-            if (unsupportedRQ || unsupportedPipeline) {
+            const bool rqUnsupported = rqCap && !nativeRQ;
+            const bool stageUnsupported = rtHard && !nativeRTP;
+            if (!g_spvCfg.denyRayTracing) {
+                // Logged once per run, and unconditionally: the message has to appear even
+                // on a card that cannot run the module, because that is exactly the case
+                // where the user must know the proxy is no longer shielding the driver.
+                static volatile LONG rtAllowedLogged = 0;
+                if (InterlockedIncrement(&rtAllowedLogged) == 1)
+                    LogLine("SPIRV: DenyRayTracing=0 - ray tracing is passed to the driver untouched %s",
+                        (stageUnsupported || rqUnsupported)
+                            ? "(this adapter does not report the feature - expect a driver error or a crash)"
+                            : "(adapter reports the feature)");
+            }
+            if (g_spvCfg.denyRayTracing && (rqUnsupported || stageUnsupported)) {
                 info.deny = true;
-                if (unsupportedRQ) info.reason += "RayQuery ";
-                if (unsupportedPipeline) info.reason += "RayTracing ";
-                if (unsupportedPipeline || (unsupportedRQ && rtHard) || GetRtCompatMode() == RT_MODE_NATIVE)
+                if (rqUnsupported) info.reason += "RayQuery ";
+                if (stageUnsupported) info.reason += "RayTracing ";
+                if (stageUnsupported || (rqUnsupported && rtHard) || GetRtCompatMode() == RT_MODE_NATIVE)
                     info.denyOther = true;
             }
         }
         if (denyMeshHere && mesh)           { info.deny = true; info.denyOther = true; info.reason += "Mesh "; }
-        info.rqOnly = rqCap && !rtHard && !nativeRQ && GetRtCompatMode() != RT_MODE_NATIVE;
+        // rqOnly means "this could be rewritten to no-hit if we decide to". It is lit
+        // only when the policy actually intends to rewrite, i.e. DenyRayTracing is on.
+        info.rqOnly = rqCap && !rtHard && !nativeRQ &&
+                      (g_spvCfg.denyRayTracing != 0) && GetRtCompatMode() != RT_MODE_NATIVE;
         // A module written for a ray-tracing STAGE (RayGeneration/Miss/ClosestHit/...)
         // cannot be turned into anything the fixed-function pipeline understands. The
         // only two honest options are "give it to the driver" or "there is no module".
@@ -6799,21 +6908,28 @@ if (si.rewritten) return std::string();
     // Resource binds use a separate lock: serialized with one another, but they no
     // longer wait behind a multi-second shader/pipeline compilation call.
     static volatile LONG g_resourceCallSequence = 0;
+    // B4: resource binds were the noisiest thing in a real log - two lines every 64th
+    // bind made up roughly 90% of 25853 lines and pushed the lines that matter
+    // (replacement verdicts, crashes) out of sight. The 64-entry ring buffer still keeps
+    // the last binds, so a crash report keeps its breadcrumbs; the disk now gets only
+    // what is useful: the first few binds (proof the path is alive), every FAILED bind,
+    // every bind slower than 100 ms (stalls are what freezes the game), and optionally a
+    // heartbeat every N thousand binds (VerboseResourceK).
     template<class F> bool DriverCallResource(F&& f) {
         const LONG callId = InterlockedIncrement(&g_resourceCallSequence);
-        // Keep the last resource operations in the 64-entry in-memory crash ring;
-        // do not write two disk lines for every buffer/image bind.
         Crumb("RESOURCE id=%ld %s", (long)callId, t_job);
-        // Small, bounded progress trace: calls 1..8, then every 64th call.
-        const bool checkpoint = (callId <= 8 || (callId % 64) == 0);
-        if (checkpoint)
-            LogLine("RESOURCE CHECKPOINT ENTER id=%ld job=%s", (long)callId, t_job);
+        const bool early = (callId <= 4);
+        const bool heartbeat = (g_spvCfg.verboseResourceK > 0) &&
+            (callId % (1000L * g_spvCfg.verboseResourceK) == 0);
+        const ULONGLONG startMs = GetTickCount64();
         const bool ok = DriverCallWithLock(f, &g_resourceLock, true, "resource-bind");
-        if (checkpoint)
-            LogLine("RESOURCE CHECKPOINT EXIT id=%ld driverOk=%u job=%s",
-                (long)callId, ok ? 1u : 0u, t_job);
-        // DriverCallWithLock still writes every crash and every slow bind (>1 s)
-        // with separate lock-wait and driver-call timings.
+        const ULONGLONG elapsedMs = GetTickCount64() - startMs;
+        if (!ok)
+            LogLine("RESOURCE FAILED id=%ld job=%s", (long)callId, t_job);
+        else if (elapsedMs >= 100)
+            LogLine("RESOURCE SLOW id=%ld elapsed=%llu ms job=%s", (long)callId, (unsigned long long)elapsedMs, t_job);
+        else if (early || heartbeat)
+            LogLine("RESOURCE id=%ld ok (binds so far: %ld) job=%s", (long)callId, (long)callId, t_job);
         return ok;
     }
 
@@ -7537,12 +7653,26 @@ vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* pInfo,
     // and the user has enabled RewriteRayQuery. This preserves the original PROXY behavior.
     std::vector<uint32_t> rewritten;
     bool didRewrite = false;
-    if (si.rqOnly && !si.deny) {
-        static volatile LONG rqPreserved = 0;
-        const LONG k = InterlockedIncrement(&rqPreserved);
-        if (k <= 12)
-            LogLine("SPIRV: RayQuery shader #%ld preserved unchanged (DenyRayTracing=0; no-hit fallback not applied)", n);
-    }
+    // A2: classify every module that could have brought light with it.
+    //   rqOnly  -> RayQuery-only: rewriting turns its rays into "no hit", which in a
+    //              light shader means a dark zone (this is the known GCN2 trade-off).
+    //   rtStage -> a real ray-tracing stage (raygen/miss/closest-hit): cannot be
+    //              rewritten at all, so it is withheld; if THE game's lighting lives
+    //              there, nothing in spv_replace can help until a module exists.
+    // Both are counted, never inferred, so the summary can say which one applies.
+    // "withheld" counts only modules that are actually kept from the driver (denied):
+    // with DenyRayTracing=0 an RT stage goes to the driver untouched and nothing is
+    // withheld, so counting it would make the summary accuse the proxy of a decision
+    // it did not make.
+    // "seen" counts every module that touches ray tracing at all, whatever the policy
+    // decides to do with it - otherwise DenyRayTracing=0 would report zero and hide the
+    // very shaders the user is asking about.
+    if (si.rqOnly || si.rtStage || si.caps.find("RayQueryKHR") != std::string::npos)
+        InterlockedIncrement(&spvrw::g_lightRqShaders);
+    if (si.rtStage && si.deny) InterlockedIncrement(&spvrw::g_lightRqWithheld);
+    // NOTE: with DenyRayTracing implemented for real, rqOnly is only ever set when the
+    // policy intends to rewrite (DenyRayTracing=1), so there is no "preserved unchanged"
+    // case left to log here. DenyRayTracing=0 is reported once by the RT POLICY line.
     // Only rewrite when the module is actually denied for a ray-tracing capability.
     if (si.deny && si.rqOnly && g_spvCfg.rewriteRayQuery) {
         std::string err;
@@ -7581,6 +7711,7 @@ vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* pInfo,
                     }
                 }
                 const LONG k = InterlockedIncrement(&rwOk);
+                InterlockedIncrement(&spvrw::g_lightRqRewritten);
                 if (k <= 5 || k % 100 == 0) LogLine("SPIRV: ray-query shader #%ld rewritten (%zu -> %zu words), total rewritten=%ld", n, nWords, rewritten.size(), (long)k);
                 if (k <= g_spvCfg.dumpRewrite) {
                     DumpSpirv("rq_in", n, code, nWords * sizeof(uint32_t));
@@ -7655,11 +7786,28 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
     NoteModuleStage(si.model, didReplace && !si.deny, si.deny);
     const bool logIt = g_spvCfg.logAll || (si.deny && dn <= 30) || n <= 10;
     if (g_spvCfg.dumpLookupInput > 0) {
+        // A1: the dumps are the raw material for new spv_replace files, so they are
+        // prioritised instead of "first N modules the game happens to compile":
+        //   1. modules that use ray tracing / ray query (that is where light is lost),
+        //   2. modules the folder could not serve,
+        //   3. everything else, to fill the budget.
+        // The file name now carries the stage, the module number and the hash, so the
+        // replacement file can be named correctly without searching the log:
+        //   spv_input_4_812_74F939DCE4AEB68A.spv
+        //     -> stage 4 (fragment), module #812, hash 74F939DCE4AEB68A
+        //     -> the replacement must be called spv_74F939DCE4AEB68A.spv
         static volatile LONG dumpedInputs = 0;
-        if (InterlockedIncrement(&dumpedInputs) <= g_spvCfg.dumpLookupInput) {
-            char tag[48];
-            _snprintf_s(tag, sizeof(tag), _TRUNCATE, "input_%u_%ld", si.model, n);
+        const bool interesting = (si.rqOnly || si.rtStage || si.deny || !didReplace);
+        const LONG budget = interesting ? g_spvCfg.dumpLookupInput : (g_spvCfg.dumpLookupInput / 4);
+        if (budget > 0 && InterlockedIncrement(&dumpedInputs) <= budget) {
+            char tag[80];
+            _snprintf_s(tag, sizeof(tag), _TRUNCATE, "input_%u_%ld_%016llX", si.model, n,
+                static_cast<unsigned long long>(originalHash));
             DumpSpirv(tag, n, originalCode, originalBytes);
+            LogLine("SPIRV: dumped module #%ld for inspection (stage %u, hash %016llX, %s%s)", n, si.model,
+                static_cast<unsigned long long>(originalHash),
+                si.rqOnly ? "ray query" : (si.rtStage ? "ray-tracing stage" : (si.deny ? "denied" : "no replacement")),
+                didReplace ? ", replaced" : "");
         }
     }
     if (n % 200 == 0) LogLine("SHADER stats: total=%ld denied=%ld", n, (long)deniedSeen);
@@ -10470,20 +10618,28 @@ vkGetDeviceProcAddr(VkDevice device, const char* pName) {
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
-    if (reason == DLL_PROCESS_DETACH && reserved != nullptr) {
-        // Process is terminating: show what the game was doing last.
-        // This branch only runs on a normal exit. If the game is force-closed, or the
-        // loader unloads the proxy early, nothing here executes - that is why the
-        // per-lookup lines above exist as well.
-        // The milestone tables are printed while the game runs; on a normal exit the final
-        // state must be in the log too, whatever the module count was, or the last table
-        // read by a human is an outdated one.
+    if (reason == DLL_PROCESS_DETACH) {
+        // The summary is printed on EVERY unload, not only when the process terminates
+        // (reserved != nullptr). Otherwise a game that unloads the proxy, or a run that
+        // ends by FreeLibrary, produces a log with no one-screen report at all - and the
+        // report is the whole point of the v17 logging.
+        // The milestone tables are printed while the game runs; at exit the final state
+        // must be in the log too, whatever the module count was, or the last table read
+        // by a human is an outdated one.
         LogReplacementSummary();
-        LogLine("DLL_PROCESS_DETACH: process is exiting. Last API breadcrumbs:");
-        const LONG end = g_crumbIdx;
-        for (int k = kCrumbCount - 16; k < kCrumbCount; ++k) {
-            const char* c = g_crumbs[(end + k) & (kCrumbCount - 1)];
-            if (c[0]) LogLine("  %s", c);
+        LogProxySummary();
+        if (reserved != nullptr) {
+            // Process is terminating: show what the game was doing last.
+            // If the game is force-closed nothing here executes - that is why the
+            // per-lookup lines above exist as well.
+            LogLine("DLL_PROCESS_DETACH: process is exiting. Last API breadcrumbs:");
+            const LONG end = g_crumbIdx;
+            for (int k = kCrumbCount - 16; k < kCrumbCount; ++k) {
+                const char* c = g_crumbs[(end + k) & (kCrumbCount - 1)];
+                if (c[0]) LogLine("  %s", c);
+            }
+        } else {
+            LogLine("DLL_PROCESS_DETACH: proxy unloaded (FreeLibrary); report above is the final state of this run");
         }
     }
     if (reason == DLL_PROCESS_ATTACH) {
