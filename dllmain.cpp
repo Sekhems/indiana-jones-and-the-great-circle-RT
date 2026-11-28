@@ -489,18 +489,23 @@ namespace {
         // Say which story the game was told. "Native RT hardware" and "virtual RT" must
         // never both be true for the same adapter - that mix is what produced FAKE ray-
         // tracing modules and a crash in the NVIDIA driver on a GTX 1660 Ti.
-        LogLine("RT POLICY: %s - the game %s",
-            anyVirtualRtWanted ? "ray tracing is VIRTUAL on this adapter (nothing RT reaches the driver)"
-                               : "ray tracing is NATIVE on this adapter (the driver owns it end to end)",
-            anyVirtualRtWanted ? (allowFallback ? "gets the compatibility path, so one spv_replace folder behaves the same everywhere"
-                                               : "gets no ray tracing at all (Mode=native and this driver lacks the feature)")
-                               : "uses its own ray tracing, and the proxy does not touch those modules");
-        // The interesting case is an asymmetric driver: it advertises one half of ray
-        // tracing and not the other (NVIDIA Pascal/Turing: pipeline yes, ray query no).
-        // Print the concrete half, because that is the fact that used to be invisible.
-        if (anyVirtualRtWanted)
-            LogLine("RT POLICY: driver reports ray_tracing_pipeline=%u ray_query=%u; both are virtualized so the game cannot build ray-tracing modules here",
-                c.extRTP ? 1u : 0u, c.extRQ ? 1u : 0u);
+        // Once per run. GetRtDeviceCaps() runs for every physical device the game
+        // enumerates (a real log had this pair of lines 15 times), and a status line that
+        // repeats loses the reader in noise.
+        if (FirstTime("rt-policy")) {
+            LogLine("RT POLICY: %s - the game %s",
+                anyVirtualRtWanted ? "ray tracing is VIRTUAL on this adapter (nothing RT reaches the driver)"
+                                   : "ray tracing is NATIVE on this adapter (the driver owns it end to end)",
+                anyVirtualRtWanted ? (allowFallback ? "gets the compatibility path, so one spv_replace folder behaves the same everywhere"
+                                                   : "gets no ray tracing at all (Mode=native and this driver lacks the feature)")
+                                   : "uses its own ray tracing, and the proxy does not touch those modules");
+            // The interesting case is an asymmetric driver: it advertises one half of ray
+            // tracing and not the other (NVIDIA Pascal/Turing: pipeline yes, ray query no).
+            // Print the concrete half, because that is the fact that used to be invisible.
+            if (anyVirtualRtWanted)
+                LogLine("RT POLICY: driver reports ray_tracing_pipeline=%u ray_query=%u; both are virtualized so the game cannot build ray-tracing modules here",
+                    c.extRTP ? 1u : 0u, c.extRQ ? 1u : 0u);
+        }
 
         // Independent capability probe: ask the driver for the concrete shader
         // features and remember them on the device profile. Shader classification
@@ -2131,6 +2136,7 @@ namespace {
     void RunReplacementSelfTest(int mode);
     // The hit counters live in spvrw; the shader path below has to bump them too.
     void NoteReplacementHit(bool exact, const char* how);
+    void NoteReplacementApplied(bool exact);
     void NoteModuleStage(uint32_t stage, bool replaced, bool denied);
     void ScanReplacements(const wchar_t* iniPath) {
         wchar_t dir[2048]{};
@@ -5112,6 +5118,12 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     SRWLOCK g_replIndexLock = SRWLOCK_INIT;
     volatile LONG g_replIndexState = 0;
     volatile LONG g_replHitsExact = 0, g_replHitsSimilar = 0, g_replMisses = 0;
+    // Lookup hits are not the same thing as replacements that actually took effect: a
+    // hit can still be followed by a rejected file (bad envelope, unreadable) or be
+    // undone by the capability check. The summary must count what HAPPENED - a real log
+    // printed "3 accepted (exact hash)" next to "NOT ONE came from spv_replace" because
+    // the byte-hash path incremented one counter and the summary read the other.
+    volatile LONG g_replAppliedExact = 0, g_replAppliedSimilar = 0;
     // Why a lookup missed: no module of this stage is even close (expected - the folder
     // holds a handful of files, the game compiles hundreds), or a plausible candidate
     // was rejected by the thresholds (actionable).
@@ -5593,29 +5605,32 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         }
     }
 
+    // Called only when the replacement was actually handed to the driver.
+    void NoteReplacementApplied(bool exact) {
+        if (exact) InterlockedIncrement(&g_replAppliedExact);
+        else InterlockedIncrement(&g_replAppliedSimilar);
+    }
+
     // One line at shutdown: whether the folder was actually used, or only matched in the
     // self-test. Without it a log that ends after "SELFTEST PASSED" is ambiguous.
     void LogReplacementSummary() {
+        // "applied" = the module the driver compiled really came from spv_replace.
+        const long appliedExact = g_replAppliedExact, appliedSim = g_replAppliedSimilar;
         const long hitExact = g_replHitsExact, hitSim = g_replHitsSimilar, miss = g_replMisses;
         const long noCand = g_replMissNoCandidate, rejected = g_replMissRejected;
-        {
-            // One line that names the stages: "folder has no compute module" is the whole
-            // explanation for most misses and needs no log analysis.
-            const long seen = g_replSeenStageMask, absent = g_replMissStageMask;
-            if (seen && InterlockedCompareExchange(&g_replMissStageLogged, 1, 0) == 0) {
-                char have[128] = {}, lack[128] = {};
-                for (int b = 0; b < 6; ++b) {
-                    if (seen & (1L << b)) { strncat_s(have, sizeof(have), StageBitName(b), _TRUNCATE); strncat_s(have, sizeof(have), " ", _TRUNCATE); }
-                    if (absent & (1L << b)) { strncat_s(lack, sizeof(lack), StageBitName(b), _TRUNCATE); strncat_s(lack, sizeof(lack), " ", _TRUNCATE); }
-                }
-                LogLine("SPIRV: stages the game compiled: [%s] | stages with NO module in spv_replace: [%s]",
-                    have, lack[0] ? lack : "none");
-            }
-        }
         {
             // Print the table at a few milestones and always at the end, so the LAST table
             // in the log is the final state. A single snapshot taken early reported
             // "compute | 11 | 0 | ..." even though the three acceptances came later.
+            //
+            // Two lessons from a real R7 260X log are baked in here:
+            //  * the stage line above was printed once, early, and never refreshed, so it
+            //    still said "no module for vertex/fragment/compute" long after all three
+            //    replacements had been accepted. It is now printed with every table, and
+            //    the LAST one is the truth.
+            //  * "no file of this stage" was printed without checking, and said so for
+            //    stages that the folder obviously served (replaced != 0). A verdict must
+            //    not contradict the counters in the same line - it now reads the counters.
             static volatile LONG tableLogged = 0;
             const LONG slot = InterlockedCompareExchange(&tableLogged, 0, 0);
             const bool firstSlot = (g_replMisses >= 200 && slot < 1);
@@ -5623,28 +5638,47 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
             if (firstSlot || secondSlot) {
                 InterlockedIncrement(&tableLogged);
                 LogLine("SPIRV SUMMARY: per stage - stage | compiled | replaced | close-but-rejected | verdict (counts so far)");
-                long todo = 0;
+                long todo = 0, replacedAny = 0;
                 for (int b = 0; b < 8; ++b) {
                     const long seen = g_stageSeen[b], hit = g_stageHit[b], close = g_stageClose[b], denied = g_stageDenied[b];
                     if (seen == 0) continue;
-                    const char* verdict = (close > 0) ? "ACTION: a file almost matched"
-                                        : (hit > 0) ? "ok"
+                    const char* verdict = (hit > 0 && close > 0) ? "ok, but other modules of this stage almost matched"
+                                        : (hit > 0) ? "ok - replacements applied"
+                                        : (close > 0) ? "ACTION: a file almost matched"
                                         : (denied > 0) ? "all denied/faked, none replaced"
                                         : "no file of this stage in the folder";
                     if (close > 0) ++todo;
+                    if (hit > 0) ++replacedAny;
                     LogLine("SPIRV SUMMARY:   %-12s | %6ld | %6ld | %6ld | %s",
                         StageBucketName(b), seen, hit, close, verdict);
                 }
                 if (todo == 0)
-                    LogLine("SPIRV SUMMARY: nothing in this log was rejected by the thresholds - the folder simply has no module for the stages listed as 'no file of this stage'");
+                    LogLine("SPIRV SUMMARY: nothing in this log was rejected by the thresholds - the remaining misses are modules the folder simply does not hold");
+                // The stage line is repeated with every table so the last one matches the
+                // counters. It is derived from the table, so it cannot contradict it.
+                char have[128] = {}, lack[128] = {};
+                for (int b = 0; b < 6; ++b) {
+                    const bool stageSeen = g_stageSeen[b] > 0;
+                    if (stageSeen) { strncat_s(have, sizeof(have), StageBitName(b), _TRUNCATE); strncat_s(have, sizeof(have), " ", _TRUNCATE); }
+                    if (stageSeen && g_stageHit[b] == 0) { strncat_s(lack, sizeof(lack), StageBitName(b), _TRUNCATE); strncat_s(lack, sizeof(lack), " ", _TRUNCATE); }
+                }
+                LogLine("SPIRV: stages the game compiled: [%s] | stages where NOTHING was replaced: [%s]",
+                    have[0] ? have : "none", lack[0] ? lack : "none");
+                if (replacedAny > 0)
+                    LogLine("SPIRV: %ld stage(s) above show replacements, so the folder IS in use in this run", replacedAny);
             }
         }
-        if (hitExact + hitSim > 0)
+        if (appliedExact + appliedSim > 0)
             LogLine("SPIRV SUMMARY: %ld of %ld compiled module(s) were replaced from spv_replace",
-                hitExact + hitSim, (long)g_spvModulesSeen);
+                appliedExact + appliedSim, (long)g_spvModulesSeen);
         else if (g_spvModulesSeen > 0)
             LogLine("SPIRV SUMMARY: %ld module(s) were compiled and NOT ONE came from spv_replace in this run - if a replacement was expected, the folder and its index need a look",
                 (long)g_spvModulesSeen);
+        // A lookup hit that never became a replacement needs its own sentence, otherwise
+        // the two lines above contradict the "accepted" line below.
+        if (hitExact + hitSim > appliedExact + appliedSim)
+            LogLine("SPIRV SUMMARY: %ld lookup(s) found a file but only %ld replaced the module - the rest were rejected when read or undone by the capability check",
+                hitExact + hitSim, appliedExact + appliedSim);
         if (hitExact + hitSim + miss == 0)
             LogLine("SPIRV SUMMARY: no shader went through the replacement lookup (self-test only, or the game never created a module)");
         else if (rejected == 0 && hitSim == 0)
@@ -5669,6 +5703,7 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     // forward the calls instead of moving the code out of the namespace.
     void ForgetReplacementIndexImpl() { spvrw::ForgetReplacementIndexImpl(); }
     void NoteReplacementHit(bool exact, const char* how) { spvrw::NoteReplacementHit(exact, how); }
+    void NoteReplacementApplied(bool exact) { spvrw::NoteReplacementApplied(exact); }
     void NoteModuleStage(uint32_t stage, bool replaced, bool denied) { spvrw::NoteModuleStage(stage, replaced, denied); }
     void LogReplacementSummary() { spvrw::LogReplacementSummary(); }
     void RunReplacementSelfTest(int mode) { spvrw::RunReplacementSelfTest(mode); }
@@ -7456,6 +7491,7 @@ vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* pInfo,
                 code = replacement.data();
                 nWords = replacement.size();
                 didReplace = true;
+                spvrw::NoteReplacementApplied(strcmp(matchKind, "hash") == 0);
                 LogLine("SPIRV: shader replacement ACCEPTED (%s) hash=%016llX (%zu -> %zu words); capability analysis will run on replacement",
                     matchKind, static_cast<unsigned long long>(originalHash), originalBytes / sizeof(uint32_t), nWords);
             } else {
