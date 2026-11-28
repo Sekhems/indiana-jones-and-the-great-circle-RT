@@ -886,20 +886,49 @@ namespace {
     // terminating the process.
     static const uint32_t kNeutralVertexModule[] = {
         0x07230203u, 0x00010000u, 0x0008000Bu, 0x0000000Du, 0x00000000u, 0x00020011u,
-        0x00000001u, 0x0003000Eu, 0x00000000u, 0x00000001u, 0x0005000Fu, 0x00000000u,
-        0x00000004u, 0x6E69616Du, 0x00000009u, 0x00040047u, 0x00000009u, 0x0000000Bu,
-        0x00000000u, 0x00020013u, 0x00000002u, 0x00030016u, 0x00000006u, 0x00000020u,
-        0x00040017u, 0x00000007u, 0x00000006u, 0x00000004u, 0x00040020u, 0x00000008u,
-        0x00000003u, 0x00000007u, 0x00030021u, 0x00000003u, 0x00000002u, 0x0004002Bu,
-        0x00000006u, 0x0000000Au, 0x00000000u, 0x0004002Bu, 0x00000006u, 0x0000000Bu,
-        0x3F800000u, 0x0004003Bu, 0x00000008u, 0x00000009u, 0x00000003u, 0x00050036u,
+        0x00000001u, 0x0003000Eu, 0x00000000u, 0x00000001u, 0x0006000Fu, 0x00000000u,
+        0x00000004u, 0x6E69616Du, 0x00000000u, 0x00000009u, 0x00040047u, 0x00000009u,
+        0x0000000Bu, 0x00000000u, 0x00020013u, 0x00000002u, 0x00030016u, 0x00000006u,
+        0x00000020u, 0x00040017u, 0x00000007u, 0x00000006u, 0x00000004u, 0x00040020u,
+        0x00000008u, 0x00000003u, 0x00000007u, 0x00030021u, 0x00000003u, 0x00000002u,
+        0x0004002Bu, 0x00000006u, 0x0000000Au, 0x00000000u, 0x0004002Bu, 0x00000006u,
+        0x0000000Bu, 0x3F800000u, 0x0004003Bu, 0x00000008u, 0x00000009u, 0x00000003u,
+        0x00050036u, 0x00000002u, 0x00000004u, 0x00000000u, 0x00000003u, 0x000200F8u,
+        0x00000005u, 0x00070050u, 0x00000007u, 0x0000000Cu, 0x0000000Au, 0x0000000Au,
+        0x0000000Au, 0x0000000Bu, 0x0003003Eu, 0x00000009u, 0x0000000Cu, 0x000100FDu,
+        0x00010038u
+    };
+    // The fragment half of the same idea. A blocked fragment shader cannot be given a
+    // vertex module: VkPipelineShaderStageCreateInfo.stage still says FRAGMENT, and was
+    // that not rejected outright it would be wrong for the pipeline layout and the
+    // render pass. This one is "void main() {}" with no inputs and no outputs, so it is
+    // valid in any render pass and simply writes nothing.
+    static const uint32_t kNeutralFragmentModule[] = {
+        0x07230203u, 0x00010000u, 0x0008000Bu, 0x00000008u, 0x00000000u, 0x00020011u,
+        0x00000001u, 0x0003000Eu, 0x00000000u, 0x00000001u, 0x0005000Fu, 0x00000004u,
+        0x00000004u, 0x6E69616Du, 0x00000000u, 0x00030010u, 0x00000004u, 0x00000007u,
+        0x00020013u, 0x00000002u, 0x00030021u, 0x00000003u, 0x00000002u, 0x00050036u,
         0x00000002u, 0x00000004u, 0x00000000u, 0x00000003u, 0x000200F8u, 0x00000005u,
-        0x00070050u, 0x00000007u, 0x0000000Cu, 0x0000000Au, 0x0000000Au, 0x0000000Au,
-        0x0000000Bu, 0x0003003Eu, 0x00000009u, 0x0000000Cu, 0x000100FDu, 0x00010038u
+        0x000100FDu, 0x00010038u
+    };
+    // And the compute half: "void main() {}" with LocalSize 1 1 1, so a compute pipeline
+    // built from it is valid and simply dispatches nothing.
+    static const uint32_t kNeutralComputeModule[] = {
+        0x07230203u, 0x00010000u, 0x0008000Bu, 0x00000008u, 0x00000000u, 0x00020011u,
+        0x00000001u, 0x0003000Eu, 0x00000000u, 0x00000001u, 0x0005000Fu, 0x00000005u,
+        0x00000004u, 0x6E69616Du, 0x00000000u, 0x00060010u, 0x00000004u, 0x00000011u,
+        0x00000001u, 0x00000001u, 0x00000001u, 0x00020013u, 0x00000002u, 0x00030021u,
+        0x00000003u, 0x00000002u, 0x00050036u, 0x00000002u, 0x00000004u, 0x00000000u,
+        0x00000003u, 0x000200F8u, 0x00000005u, 0x000100FDu, 0x00010038u
     };
     inline bool IsNeutralModule(const void* code, size_t bytes) noexcept {
-        return code && bytes == sizeof(kNeutralVertexModule) &&
-            memcmp(code, kNeutralVertexModule, bytes) == 0;
+        if (!code) return false;
+        return (bytes == sizeof(kNeutralVertexModule) &&
+                memcmp(code, kNeutralVertexModule, bytes) == 0) ||
+               (bytes == sizeof(kNeutralFragmentModule) &&
+                memcmp(code, kNeutralFragmentModule, bytes) == 0) ||
+               (bytes == sizeof(kNeutralComputeModule) &&
+                memcmp(code, kNeutralComputeModule, bytes) == 0);
     }
 
     // A pipeline stage that references a withheld (FAKE) module must never reach the
@@ -6616,14 +6645,22 @@ if (si.rewritten) return std::string();
     // had to be withheld from the driver: a valid handle keeps every later API call
     // well-formed, while a FAKE 0xFA4E... handle makes the ICD fault (0xC0000005 on
     // a GTX 1660 Ti run). Returns false only if the driver itself refuses it.
-    inline bool CreateNeutralModule(VkDevice device, VkShaderModule& out) noexcept {
+    inline bool CreateNeutralModule(VkDevice device, VkShaderModule& out,
+        VkShaderStageFlagBits stage = VK_SHADER_STAGE_VERTEX_BIT) noexcept {
         out = VK_NULL_HANDLE;
         auto real = RealExport<PFN_vkCreateShaderModule>("vkCreateShaderModule");
         if (!real || !device) return false;
+        // The stage of the module must match the stage the application declares, so pick
+        // the neutral module for it. Anything that is not FRAGMENT gets the vertex one:
+        // ray-tracing stages never reach the driver at all (they are denied earlier).
+        const uint32_t* code = kNeutralVertexModule;
+        size_t bytes = sizeof(kNeutralVertexModule);
+        if (stage == VK_SHADER_STAGE_FRAGMENT_BIT) { code = kNeutralFragmentModule; bytes = sizeof(kNeutralFragmentModule); }
+        else if (stage == VK_SHADER_STAGE_COMPUTE_BIT) { code = kNeutralComputeModule; bytes = sizeof(kNeutralComputeModule); }
         VkShaderModuleCreateInfo ci{};
         ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        ci.codeSize = sizeof(kNeutralVertexModule);
-        ci.pCode = kNeutralVertexModule;
+        ci.codeSize = bytes;
+        ci.pCode = code;
         VkShaderModule m = VK_NULL_HANDLE;
         bool ok = true;
         if (g_spvCfg.catchDriverCrash) ok = SehRun([&]() { real(device, &ci, nullptr, &m); });
@@ -7828,7 +7865,13 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
         // neutral module for the same reason as above: the game must not be able to
         // hand a 0xFA4E... handle back to the ICD, which is an access violation.
         VkShaderModule neutral = VK_NULL_HANDLE;
-        if (CreateNeutralModule(device, neutral)) {
+        // Pick the neutral module that matches the stage the game asked for: FRAGMENT gets
+        // the empty fragment shader, COMPUTE the empty compute one, everything else the
+        // vertex one. A mismatch is not a cosmetic issue - the pipeline declares the stage.
+        VkShaderStageFlagBits denyStage = VK_SHADER_STAGE_VERTEX_BIT;
+        if (si.model == 4) denyStage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        else if (si.model == 5) denyStage = VK_SHADER_STAGE_COMPUTE_BIT;
+        if (CreateNeutralModule(device, neutral, denyStage)) {
             LogLine("vkCreateShaderModule #%ld FAILED: result=%d caps=[%s] -> neutral module instead", n, (int)r, si.caps.c_str());
             *pShaderModule = neutral;
         } else {
@@ -8795,7 +8838,7 @@ vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count
                     for (auto& st : patched[i]) {
                         if (!StageIsFake(st)) continue;
                         VkShaderModule m = VK_NULL_HANDLE;
-                        if (CreateNeutralModule(device, m)) st.module = m;
+                        if (CreateNeutralModule(device, m, static_cast<VkShaderStageFlagBits>(st.stage))) st.module = m;
                         else { repaired = false; break; }
                     }
                     ci.pStages = patched[i].data();
@@ -9026,7 +9069,7 @@ vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_
             for (uint32_t i = 0; i < createInfoCount; ++i) {
                 if (!isFakePipe[i]) continue;
                 VkShaderModule m = VK_NULL_HANDLE;
-                if (CreateNeutralModule(device, m)) sub[i].stage.module = m;
+                if (CreateNeutralModule(device, m, static_cast<VkShaderStageFlagBits>(sub[i].stage.stage))) sub[i].stage.module = m;
                 else { repairFailed++; isFakePipe[i] = 2; }
             }
             if (repairFailed)
