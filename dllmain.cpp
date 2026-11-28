@@ -150,9 +150,11 @@ namespace {
     constexpr const char* kProxyBuildNotes = "report after first frame | quiet trace | honest counts | AS/geometry evidence for SoftwareRT";
 
     // A5: set by the device probe (below) and read by the acceleration-structure
-    // bookkeeping, which is defined much later in the file. Declared here because the
-    // probe needs it before the SoftwareRT block exists.
-    extern volatile LONG g_asVertexDataAddressable;
+    // bookkeeping, which is defined much later in the file. DEFINED here, not declared
+    // extern: the bookkeeping block sits in a nested anonymous namespace, and an extern
+    // declaration in this one would never be satisfied by a definition in that one
+    // (MSVC: C7631, "declared but not defined").
+    volatile LONG g_asVertexDataAddressable = 0;
 
     // Version reported to the game when the real driver reports less.
     const uint32_t kSpoofMinApiMajorMinor = VK_MAKE_API_VERSION(0, 1, 3, 0);
@@ -2183,8 +2185,8 @@ namespace {
 
     // Vertex data is only reachable if the buffer address can be resolved. On a Vulkan
     // 1.2 driver bufferDeviceAddress is the only way to turn the game's device address
-    // into memory we can read, so the flag is kept here and printed with the summary.
-    volatile LONG g_asVertexDataAddressable = 0;
+    // into memory we can read. The flag itself is defined near the top of the file,
+    // where the device probe that sets it lives.
     volatile LONG g_asSummaryLogged = 0;
 
     inline void NoteAsGeometry(const VkAccelerationStructureBuildGeometryInfoKHR& info) {

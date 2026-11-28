@@ -112,6 +112,87 @@ def outer_declared(lines, start, end):
     return names
 
 
+# ---------------------------------------------------------------------------
+# Nested anonymous namespaces
+# ---------------------------------------------------------------------------
+# dllmain.cpp has a file-wide `namespace {` and, inside it, a second `namespace {`
+# for the SPIR-V/SoftwareRT block. A symbol defined in the inner one is a DIFFERENT
+# entity from a symbol declared in the outer one, so:
+#   * `extern T x;` outside + `T x = 0;` inside  ->  MSVC C7631 (declared, not defined)
+#   * a use inside that expects the outer x      ->  it silently sees nothing
+# Both cost a build round-trip each. This check reports every global that exists in
+# more than one anonymous namespace, or whose declaration and definition disagree.
+ANON_NS = re.compile(r'^namespace\s*\{')
+
+
+def anon_namespace_depths(lines):
+    """Returns [(start_index, end_index, depth_factor)] for every anonymous namespace."""
+    ranges = []
+    depth = 0
+    stack = []
+    for i, line in enumerate(lines):
+        code = strip_noise(line).strip()
+        if ANON_NS.match(code):
+            stack.append((i, depth))
+        depth += line.count('{') - line.count('}')
+        while stack and depth <= stack[-1][1]:
+            start, d = stack.pop()
+            ranges.append((start, i, d))
+    return ranges
+
+
+def find_split_globals(lines):
+    """Reports globals that will not link or will silently be two objects.
+
+    Only one case is a hard error: `extern T x;` inside an anonymous namespace whose
+    definition lives in a DIFFERENT anonymous namespace (MSVC C7631 - the extern is
+    never satisfied). Two same-named globals in two anonymous namespaces are legal C++
+    and only reported as a note, because that is all they are.
+    """
+    ranges = anon_namespace_depths(lines)
+    if not ranges:
+        return [], []
+
+    def owner(idx):
+        best = None
+        for start, end, _ in ranges:
+            if start <= idx <= end:
+                # innermost wins: the smallest enclosing range
+                if best is None or (end - start) < (best[1] - best[0]):
+                    best = (start, end)
+        return best[0] if best else None
+
+    decl_re = re.compile(r'^\s*(?:static\s+)?(?:extern\s+)?(?:volatile\s+|const\s+|constexpr\s+)*'
+                         r'[\w:<>]+[\s\*]+(g_\w+)\s*(?:=|;)')
+    externs = []     # (name, line, owner)
+    definitions = {}  # name -> set(owner)
+    lines_of = {}     # name -> first definition line
+    for i, line in enumerate(lines):
+        code = strip_noise(line)
+        m = decl_re.match(code)
+        if not m:
+            continue
+        name = m.group(1)
+        if 'extern' in code:
+            externs.append((name, i + 1, owner(i)))
+        elif '=' in code or code.rstrip().endswith(';'):
+            definitions.setdefault(name, set()).add(owner(i))
+            lines_of.setdefault(name, i + 1)
+
+    errors = []
+    for name, line, own in externs:
+        if name not in definitions:
+            errors.append(('extern-without-definition', line, name, None))
+        elif own not in definitions[name]:
+            errors.append(('extern-in-other-namespace', line, name, lines_of.get(name)))
+
+    notes = []
+    for name, owners in definitions.items():
+        if len(owners) > 1:
+            notes.append(('two objects', name, sorted(o + 1 for o in owners if o is not None)))
+    return errors, notes
+
+
 def main():
     raw = SOURCE.read_bytes()
     text = raw.decode('utf-8-sig').replace('\r\n', '\n')
@@ -121,6 +202,8 @@ def main():
     if not names:
         print('ERROR: no declarations found inside namespace %s' % NSPACE, file=sys.stderr)
         return 1
+
+    split_errors, split_notes = find_split_globals(lines)
 
     forwarded = outer_declared(lines, start, end)
     problems = []
@@ -147,9 +230,24 @@ def main():
             if m.group(1) not in names:
                 bogus.append((i + 1, m.group(1)))
 
-    if not problems and not bogus:
+    for kind, line, name, other in split_errors:
+        if kind == 'extern-without-definition':
+            print('  dllmain.cpp(%d): %s declared extern but never defined (MSVC C7631)' % (line, name))
+        else:
+            print('  dllmain.cpp(%d): %s is extern here but defined at line %s in another '
+                  'anonymous namespace (MSVC C7631)' % (line, name, other))
+    if split_errors:
+        print('FAIL: globals split across anonymous namespaces:')
+        print('\nFix: define the global in the same anonymous namespace as the extern, or\n'
+              'put a single definition next to the code that sets it.')
+    for kind, name, owners in split_notes:
+        print('note: %s is defined twice, in anonymous namespaces starting at lines %s '
+              '(legal, but they are two different objects)' % (name, ', '.join(map(str, owners))))
+
+    if not problems and not bogus and not split_errors:
         print('OK: every %s symbol used outside the namespace is qualified or forwarded '
-              '(%d names checked)' % (NSPACE, len(names)))
+              '(%s names checked), and no global is split across anonymous namespaces'
+              % (NSPACE, len(names)))
         return 0
 
     if bogus:
