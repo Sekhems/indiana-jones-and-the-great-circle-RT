@@ -5134,6 +5134,10 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
     volatile LONG g_replMissStageMask = 0;
     volatile LONG g_replMissStageLogged = 0;   // 0 = not yet reported in the summary
     volatile LONG g_replSeenStageMask = 0;
+    // Which stages have actually had a replacement applied, and which of those the last
+    // printed table already knew about. A difference means the table is out of date.
+    volatile LONG g_stageHitMask = 0;
+    volatile LONG g_stageHitMaskLogged = 0;
     // Per stage: how many modules the game compiled, how many the folder answered,
     // and how many lookups had a close candidate that the thresholds rejected. This is
     // what tells the user whether there is anything left to capture.
@@ -5588,7 +5592,10 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         const int b = StageBucket(stage);
         if (b < 0 || b > 7) return;
         InterlockedIncrement(&g_stageSeen[b]);
-        if (replaced) InterlockedIncrement(&g_stageHit[b]);
+        if (replaced) {
+            InterlockedIncrement(&g_stageHit[b]);
+            InterlockedOr(&g_stageHitMask, 1L << b);
+        }
         if (denied) InterlockedIncrement(&g_stageDenied[b]);
     }
 
@@ -5635,7 +5642,14 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
             const LONG slot = InterlockedCompareExchange(&tableLogged, 0, 0);
             const bool firstSlot = (g_replMisses >= 200 && slot < 1);
             const bool secondSlot = (g_replMisses >= 600 && slot < 2);
-            if (firstSlot || secondSlot) {
+            // A run where every replacement arrives AFTER the last milestone used to end
+            // with a stale table: a real log replaced all three shaders at module 800, so
+            // the final table still said "no file of this stage" for all of them and
+            // "NOT ONE came from spv_replace" was the last word on the subject. Force one
+            // table as soon as a replacement lands after both milestones.
+            const bool lateReplacement = (slot >= 2) && (g_stageHitMask != g_stageHitMaskLogged);
+            if (firstSlot || secondSlot || lateReplacement) {
+                if (lateReplacement) InterlockedExchange(&g_stageHitMaskLogged, g_stageHitMask);
                 InterlockedIncrement(&tableLogged);
                 LogLine("SPIRV SUMMARY: per stage - stage | compiled | replaced | close-but-rejected | verdict (counts so far)");
                 long todo = 0, replacedAny = 0;
@@ -10461,6 +10475,9 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
         // This branch only runs on a normal exit. If the game is force-closed, or the
         // loader unloads the proxy early, nothing here executes - that is why the
         // per-lookup lines above exist as well.
+        // The milestone tables are printed while the game runs; on a normal exit the final
+        // state must be in the log too, whatever the module count was, or the last table
+        // read by a human is an outdated one.
         LogReplacementSummary();
         LogLine("DLL_PROCESS_DETACH: process is exiting. Last API breadcrumbs:");
         const LONG end = g_crumbIdx;
